@@ -1,6 +1,17 @@
+---
 name: build
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: '1Cat-vLLM branch / tag / commit to build from (e.g. main, v1.5.0, a1b2c3d). Leave empty for main.'
+        required: false
+        default: 'main'
+        type: string
+      image_tag:
+        description: 'Docker image tag (e.g. v1.5.0). Leave empty to auto-detect from git tag.'
+        required: false
+        type: string
 
 permissions:
   packages: write
@@ -9,95 +20,128 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  VLLM_REPO: abcd19886/1Cat-vLLM
 
 jobs:
-  pre-check:
+  check-and-build:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
-      git_sha: ${{ steps.check.outputs.git_sha }}
-      image_tag: ${{ steps.check.outputs.image_tag }}
+      version_tag: ${{ steps.check.outputs.version_tag }}
+      vllm_commit: ${{ steps.check.outputs.vllm_commit }}
+
     steps:
-      - name: Checkout code
+      # ① 拉取 1Cat-vLLM 源码
+      - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v4
+        with:
+          repository: abcd19886/1Cat-vLLM
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0   # 拉全部 tag，用于自动检测版本号
 
-      - name: Install crane
-        uses: imjasonh/setup-crane@v0
-
-      - name: Check image exists
+      # ② 确定版本号 + 检查镜像是否已存在
+      - name: Determine version & check image
         id: check
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE_TAG="${{ env.REGISTRY }}/${IMAGE_LOWER}:sha-${GIT_SHA}"
-          echo "GIT_SHA=${GIT_SHA}"
-          echo "IMAGE_TAG=${IMAGE_TAG}"
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "1Cat-vLLM commit: ${COMMIT}"
 
-          if crane manifest "${IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "✅ Image already exists, skip build"
-            SHOULD_BUILD="false"
+          # 版本号：优先用用户输入，否则取最新 git tag，兜底用 commit
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            VERSION="${{ inputs.image_tag }}"
           else
-            echo "🆕 Image not found, proceed build"
-            SHOULD_BUILD="true"
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "dev-${COMMIT}")
+          fi
+          echo "Image tag: ${VERSION}"
+
+          # 检查镜像是否已存在
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+          echo "Checking if ${IMAGE_TAG} already exists..."
+
+          RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/v2/$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" 2>/dev/null || echo "000")
+
+          if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "401" ]; then
+            TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:${{ env.IMAGE_NAME }}:pull" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+            if [ -n "$TOKEN" ]; then
+              RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+                "https://ghcr.io/v2/$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" 2>/dev/null || echo "000")
+            fi
           fi
 
-          {
-            echo "should_build=${SHOULD_BUILD}"
-            echo "git_sha=${GIT_SHA}"
-            echo "image_tag=${IMAGE_TAG}"
-          } >> "$GITHUB_OUTPUT"
+          if [ "$RESPONSE" = "200" ]; then
+            echo "Image ${IMAGE_TAG} already exists. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Image ${IMAGE_TAG} does not exist. Will build from source."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "version_tag=${VERSION}" >> $GITHUB_OUTPUT
+          echo "vllm_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build:
-    needs: pre-check
-    if: needs.pre-check.outputs.should_build == 'true'
+    needs: check-and-build
+    if: needs.check-and-build.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout full source code (fork local code)
+      # ① 拉取主仓库（Dockerfile 所在仓库）
+      - name: Checkout main repo
         uses: actions/checkout@v4
 
+      # ② 拉取 1Cat-vLLM 源码到 vllm-source/ 子目录（进入 build context）
+      - name: Checkout 1Cat-vLLM source
+        uses: actions/checkout@v4
+        with:
+          repository: abcd19886/1Cat-vLLM
+          ref: ${{ needs.check-and-build.outputs.vllm_commit }}
+          path: vllm-source
+
+      # ③ Docker 构建环境
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login ghcr.io
+      - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare meta
+      # ④ 镜像元数据
+      - name: Extract metadata
         id: meta
         run: |
-          GIT_SHA="${{ needs.pre-check.outputs.git_sha }}"
+          VERSION="${{ needs.check-and-build.outputs.version_tag }}"
           IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          {
-            echo "repo=${{ env.REGISTRY }}/${IMAGE_LOWER}"
-            echo "sha_tag=sha-${GIT_SHA}"
-          } >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> $GITHUB_OUTPUT
+          echo "tag=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Build & Push (compile wheel inside docker container)
+      # ⑤ 构建并推送（源码在 context 的 vllm-source/ 下，由 Dockerfile 编译）
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./docker/Dockerfile
+          file: ./Dockerfile
           push: true
           tags: |
-            ${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ steps.meta.outputs.repo }}:latest
-          build-args: |
-            GIT_SHA=${{ needs.pre-check.outputs.git_sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Workflow summary
+      # ⑥ 构建摘要
+      - name: Summary
         run: |
-          GIT_SHA="${{ needs.pre-check.outputs.git_sha }}"
-          REPO="${{ steps.meta.outputs.repo }}"
-          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
-          {
-            echo "### Docker Image Build Complete"
-            echo ""
-            echo "Commit SHA: \`${GIT_SHA}\`"
-            echo "Image: \`${REPO}:${SHA_TAG}\`"
-            echo "Latest tag: \`${REPO}:latest\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### Docker Image Built (from source)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Also tagged: \`${{ steps.meta.outputs.image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1Cat-vLLM: https://github.com/abcd19886/1Cat-vLLM @ \`${{ needs.check-and-build.outputs.vllm_commit }}\`" >> $GITHUB_STEP_SUMMARY
