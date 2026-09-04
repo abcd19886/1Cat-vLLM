@@ -1,0 +1,58 @@
+name: build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+permissions:
+  packages: write
+  contents: read
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu‑22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup buildx
+        uses: docker/setup‑buildx‑action@v3
+
+      - name: Login ghcr.io
+        uses: docker/login‑action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short commit hash
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev‑parse --short HEAD)
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push Docker image（本地编译源码打入镜像）
+        uses: docker/build‑push‑action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build‑args: |
+            # 不再使用外部wheel_url，Dockerfile内部编译本仓库源码
+          cache‑from: type=gha
+          cache‑to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Docker Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit SHA: \`${{ steps.vars.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Also tagged: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
