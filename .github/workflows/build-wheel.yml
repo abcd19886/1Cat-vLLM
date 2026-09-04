@@ -102,7 +102,13 @@ jobs:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ needs.check-and-build.outputs.vllm_commit }}
           path: vllm-source
-
+      - name: Enable swap memory
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show
       # ③ Docker 构建环境
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
