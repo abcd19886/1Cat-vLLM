@@ -114,7 +114,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `extensions-build`) inherit a root-owned, non-root-unreadable layout.
 # See #15174, #15359, #31959. Child stages inherit these via Dockerfile
 # `ENV` unless they override them explicitly.
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
@@ -320,7 +320,7 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
@@ -442,7 +442,7 @@ FROM base AS extensions-build
 ARG CUDA_VERSION
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 
@@ -482,7 +482,7 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
@@ -570,7 +570,7 @@ ARG BUILD_OS
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
@@ -697,7 +697,7 @@ RUN python3 -m pip install uv
 # images (`FROM vllm/vllm-openai` + `USER <uid>`) and direct non-root runs
 # (`docker run --user <uid>:<gid>`) can read and execute them. See #15174,
 # #15359, #31959.
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
@@ -900,7 +900,7 @@ ARG PYTORCH_CUDA_INDEX_BASE_URL
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
@@ -978,7 +978,7 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
-ENV UV_HTTP_TIMEOUT=500
+ENV UV_HTTP_TIMEOUT=1200
 
 # install kv_connectors if requested
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
