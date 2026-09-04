@@ -59,7 +59,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ shturl.cc/xM }}
+          username: ${{ shturl.cc/70 }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare meta
