@@ -35,14 +35,17 @@ jobs:
 
           if crane manifest "${IMAGE_TAG}" >/dev/null 2>&1; then
             echo "✅ Image already exists, skip build"
-            echo "should_build=false" >> $GITHUB_OUTPUT
+            SHOULD_BUILD="false"
           else
             echo "🆕 Image not found, proceed build"
-            echo "should_build=true" >> $GITHUB_OUTPUT
+            SHOULD_BUILD="true"
           fi
 
-          echo "git_sha=${GIT_SHA}" >> $GITHUB_OUTPUT
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          {
+            echo "should_build=${SHOULD_BUILD}"
+            echo "git_sha=${GIT_SHA}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: pre-check
@@ -59,16 +62,18 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ shturl.cc/70 }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare meta
         id: meta
         run: |
-          GIT_SHA=${{ needs.pre-check.outputs.git_sha }}
+          GIT_SHA="${{ needs.pre-check.outputs.git_sha }}"
           IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          echo "repo=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> $GITHUB_OUTPUT
-          echo "sha_tag=sha-${GIT_SHA}" >> $GITHUB_OUTPUT
+          {
+            echo "repo=${{ env.REGISTRY }}/${IMAGE_LOWER}"
+            echo "sha_tag=sha-${GIT_SHA}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build & Push (compile wheel inside docker container)
         uses: docker/build-push-action@v6
@@ -86,8 +91,13 @@ jobs:
 
       - name: Workflow summary
         run: |
-          echo "### Docker Image Build Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Commit SHA: \`${{ needs.pre-check.outputs.git_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Image: \`${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Latest tag: \`${{ steps.meta.outputs.repo }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          GIT_SHA="${{ needs.pre-check.outputs.git_sha }}"
+          REPO="${{ steps.meta.outputs.repo }}"
+          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
+          {
+            echo "### Docker Image Build Complete"
+            echo ""
+            echo "Commit SHA: \`${GIT_SHA}\`"
+            echo "Image: \`${REPO}:${SHA_TAG}\`"
+            echo "Latest tag: \`${REPO}:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
