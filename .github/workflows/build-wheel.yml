@@ -1,58 +1,93 @@
 name: build
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
+
 permissions:
   packages: write
   contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
-    runs-on: ubuntu‑22.04
+  pre-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      git_sha: ${{ steps.check.outputs.git_sha }}
+      image_tag: ${{ steps.check.outputs.image_tag }}
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: true
 
-      - name: Setup buildx
-        uses: docker/setup‑buildx‑action@v3
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0
+
+      - name: Check image exists
+        id: check
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_TAG="${{ env.REGISTRY }}/${IMAGE_LOWER}:sha-${GIT_SHA}"
+          echo "GIT_SHA=${GIT_SHA}"
+          echo "IMAGE_TAG=${IMAGE_TAG}"
+
+          if crane manifest "${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "✅ Image already exists, skip build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "🆕 Image not found, proceed build"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "git_sha=${GIT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+  build:
+    needs: pre-check
+    if: needs.pre-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full source code (fork local code)
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login ghcr.io
-        uses: docker/login‑action@v3
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          username: ${{ shturl.cc/xM }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get short commit hash
-        id: vars
+      - name: Prepare meta
+        id: meta
         run: |
-          SHORT_SHA=$(git rev‑parse --short HEAD)
-          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          GIT_SHA=${{ needs.pre-check.outputs.git_sha }}
+          IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> $GITHUB_OUTPUT
+          echo "sha_tag=sha-${GIT_SHA}" >> $GITHUB_OUTPUT
 
-      - name: Build & Push Docker image（本地编译源码打入镜像）
-        uses: docker/build‑push‑action@v6
+      - name: Build & Push (compile wheel inside docker container)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          build‑args: |
-            # 不再使用外部wheel_url，Dockerfile内部编译本仓库源码
-          cache‑from: type=gha
-          cache‑to: type=gha,mode=max
+            ${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.repo }}:latest
+          build-args: |
+            GIT_SHA=${{ needs.pre-check.outputs.git_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Summary
+      - name: Workflow summary
         run: |
-          echo "### Docker Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "### Docker Image Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Commit SHA: \`${{ steps.vars.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Also tagged: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "Commit SHA: \`${{ needs.pre-check.outputs.git_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Latest tag: \`${{ steps.meta.outputs.repo }}:latest\`" >> $GITHUB_STEP_SUMMARY
