@@ -35,6 +35,7 @@ jobs:
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ inputs.ref }}
+          submodules: true
           fetch-depth: 0
 
       - name: Determine version & check image
