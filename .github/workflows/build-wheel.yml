@@ -23,7 +23,8 @@ env:
 
 jobs:
   check-and-build:
-    runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version_tag: ${{ steps.check.outputs.version_tag }}
