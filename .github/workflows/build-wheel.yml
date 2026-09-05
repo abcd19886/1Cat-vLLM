@@ -116,7 +116,14 @@ jobs:
           sudo mkswap ${SWAP_PATH}
           sudo swapon ${SWAP_PATH}
           swapon --show
-
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt clean
+          df -h
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -147,7 +154,7 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
           build-args: |
             TORCH_CUDA_ARCH_LIST="7.0"
 
