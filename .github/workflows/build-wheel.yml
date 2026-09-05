@@ -141,6 +141,7 @@ jobs:
           file: ./docker/Dockerfile
           push: true
           debug: true
+          no-cache: true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
