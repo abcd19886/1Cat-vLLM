@@ -122,6 +122,9 @@ ENV UV_INSTALL_DIR=/opt/uv/bin
 ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
 ENV VIRTUAL_ENV="/opt/venv"
 
+
+# 编译并发数，防止CI内存爆炸
+ENV MAX_JOBS=2
 # Install system dependencies including build tools.
 # The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
 # (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
@@ -196,12 +199,17 @@ RUN gcc --version
 # Enable CUDA forward compatibility by setting '-e VLLM_ENABLE_CUDA_COMPATIBILITY=1'
 # Only needed for datacenter/professional GPUs with older drivers.
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
-ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
+# V100 sm_70 编译架构限定
 ENV TORCH_CUDA_ARCH_LIST="7.0"
-# 强制cutlass只编译sm_70，解决cutlass无视
+ENV CMAKE_CUDA_ARCHITECTURES="70"
 ENV CUTLASS_NVCC_ARCHS="70"
-ENV MAX_JOBS=2
+
+# vllm兼容性与内核开关
+ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ENV VLLM_DISABLE_MXFP4_KERNELS=1
+
+# 编译并发数，防止CI内存爆炸
+ENV MAX_JOBS=2
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
@@ -351,6 +359,14 @@ COPY csrc csrc/
 COPY flash_qla flash_qla/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
+# ================= V100 sm70 patch begin =================
+# 删除需要CUDA>=12.9的mxfp4_experts_quant.cu，规避static_assert编译报错
+RUN rm -f /workspace/csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu
+# ================= V100 sm70 patch end =================
+
+# max jobs used by Ninja to build extensions
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
 
 # max jobs used by Ninja to build extensions
 ARG max_jobs=2
@@ -990,7 +1006,7 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ENV UV_HTTP_TIMEOUT=1200
 
 # install kv_connectors if requested
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
+ARG torch_cuda_arch_list='7.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
