@@ -207,11 +207,9 @@ ENV CUTLASS_NVCC_ARCHS="70"
 # vllm兼容性与内核开关
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ENV VLLM_DISABLE_MXFP4_KERNELS=1
-ENV VLLM_DISABLE_DEEPGEMM=1
-ENV VLLM_DISABLE_FLASHINFER=1
 # 编译并发数，防止CI内存爆炸
 ENV FLASHINFER_CUBIN_ARCHS="sm70"
-ENV MAX_JOBS=2
+ENV MAX_JOBS=4
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
@@ -318,6 +316,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
 ARG TARGETPLATFORM
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -471,7 +471,7 @@ WORKDIR /workspace
 # Build DeepEP wheels
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=73b6ea4
+ARG DEEPEP_COMMIT_HASH=2718490
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
