@@ -85,7 +85,8 @@ jobs:
   build:
     needs: check-and-build
     if: needs.check-and-build.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Checkout main repo
