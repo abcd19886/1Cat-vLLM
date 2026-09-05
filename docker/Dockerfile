@@ -198,9 +198,9 @@ RUN gcc --version
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ENV TORCH_CUDA_ARCH_LIST="7.0"
-# 强制cutlass只编译sm_70，解决cutlass无视TORCH_CUDA_ARCH_LIST
+# 强制cutlass只编译sm_70，解决cutlass无视
 ENV CUTLASS_NVCC_ARCHS="70"
-ENV MAX_JOBS=4
+ENV MAX_JOBS=2
 ENV VLLM_DISABLE_MXFP4_KERNELS=1
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
