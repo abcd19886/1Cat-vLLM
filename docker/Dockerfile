@@ -22,7 +22,7 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=12.8.0
+ARG CUDA_VERSION=12.8.1
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
@@ -207,7 +207,8 @@ ENV CUTLASS_NVCC_ARCHS="70"
 # vllm兼容性与内核开关
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ENV VLLM_DISABLE_MXFP4_KERNELS=1
-
+ENV VLLM_DISABLE_DEEPGEMM=1
+ENV VLLM_DISABLE_FLASHINFER=1
 # 编译并发数，防止CI内存爆炸
 ENV MAX_JOBS=2
 # ============================================================
@@ -358,10 +359,7 @@ COPY csrc csrc/
 COPY flash_qla flash_qla/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
-# ================= V100 sm70 patch begin =================
-# 删除需要CUDA>=12.9的mxfp4_experts_quant.cu，规避static_assert编译报错
-RUN rm -f /workspace/csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu
-# ================= V100 sm70 patch end =================
+
 
 # max jobs used by Ninja to build extensions
 ARG max_jobs=2
@@ -455,34 +453,15 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 #################### CSRC BUILD IMAGE ####################
 
+
 #################### EXTENSIONS BUILD IMAGE ####################
-# Build DeepEP - runs in PARALLEL with csrc-build
-# This stage is independent and doesn't affect csrc cache
+# DeepEP requires sm_90+, V100(sm70) skip build entirely
 FROM base AS extensions-build
-ARG CUDA_VERSION
-
-# This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
-ENV UV_HTTP_TIMEOUT=1200
-ENV UV_INDEX_STRATEGY="unsafe-best-match"
-ENV UV_LINK_MODE=copy
-
 WORKDIR /workspace
-
-# Build DeepEP wheels
-COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
-# Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=73b6ea4
-ARG NVSHMEM_VER
-RUN --mount=type=cache,target=/opt/uv/cache \
-    mkdir -p /tmp/ep_kernels_workspace/dist && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+# create empty dist folder，给后续COPY占位，不编译DeepEP
+RUN mkdir -p /tmp/ep_kernels_workspace/dist
 #################### EXTENSIONS BUILD IMAGE ####################
+
 
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
