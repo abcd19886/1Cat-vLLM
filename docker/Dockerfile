@@ -1,4 +1,4 @@
-# The vLLM Dockerfile is used to construct vLLM image that can be directly used
+3# The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
 
 # Please update any changes made here to
@@ -197,7 +197,10 @@ RUN gcc --version
 # Only needed for datacenter/professional GPUs with older drivers.
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
-
+ENV TORCH_CUDA_ARCH_LIST="7.0"
+# 强制cutlass只编译sm_70，解决cutlass无视TORCH_CUDA_ARCH_LIST
+ENV CUTLASS_NVCC_ARCHS="70"
+ENV MAX_JOBS=4
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
