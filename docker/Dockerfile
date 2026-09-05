@@ -201,6 +201,7 @@ ENV TORCH_CUDA_ARCH_LIST="7.0"
 # 强制cutlass只编译sm_70，解决cutlass无视TORCH_CUDA_ARCH_LIST
 ENV CUTLASS_NVCC_ARCHS="70"
 ENV MAX_JOBS=4
+ENV VLLM_DISABLE_MXFP4_KERNELS=1
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
