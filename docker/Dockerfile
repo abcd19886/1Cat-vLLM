@@ -22,7 +22,7 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.0.2
+ARG CUDA_VERSION=12.8.0
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
@@ -200,7 +200,7 @@ RUN gcc --version
 # Only needed for datacenter/professional GPUs with older drivers.
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 # V100 sm_70 编译架构限定
-ENV TORCH_CUDA_ARCH_LIST="7.0"
+ENV torch_cuda_arch_list="7.0"
 ENV CMAKE_CUDA_ARCHITECTURES="70"
 ENV CUTLASS_NVCC_ARCHS="70"
 
@@ -259,7 +259,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Explicitly set the list to avoid issues with torch 2.2
 # See https://github.com/pytorch/pytorch/pull/123243
 # From versions.json: .torch.cuda_arch_list
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
+ARG torch_cuda_arch_list='7.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
