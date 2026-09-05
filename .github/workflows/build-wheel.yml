@@ -20,10 +20,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VLLM_REPO: abcd19886/1Cat-vLLM
-  # 国内 pip 源（编译阶段也生效）
-  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
-  PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
-  PIP_BUILD_ISOLATION: "0"
 
 jobs:
   check-and-build:
@@ -34,22 +30,19 @@ jobs:
       vllm_commit: ${{ steps.check.outputs.vllm_commit }}
 
     steps:
-      # ① 拉取 1Cat-vLLM 源码
       - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v4
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ inputs.ref }}
-          fetch-depth: 0   # 拉全部 tag，用于自动检测版本号
+          fetch-depth: 0
 
-      # ② 确定版本号 + 检查镜像是否已存在
       - name: Determine version & check image
         id: check
         run: |
           COMMIT=$(git rev-parse --short HEAD)
           echo "1Cat-vLLM commit: ${COMMIT}"
 
-          # 版本号：优先用用户输入，否则取最新 git tag，兜底用 commit
           if [ -n "${{ inputs.image_tag }}" ]; then
             VERSION="${{ inputs.image_tag }}"
           else
@@ -57,7 +50,6 @@ jobs:
           fi
           echo "Image tag: ${VERSION}"
 
-          # 检查镜像是否已存在
           IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
           echo "Checking if ${IMAGE_TAG} already exists..."
 
@@ -94,11 +86,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ① 拉取主仓库（Dockerfile 所在仓库）
       - name: Checkout main repo
         uses: actions/checkout@v4
 
-      # ② 拉取 1Cat-vLLM 源码到 vllm-source/ 子目录（进入 build context）
       - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v4
         with:
@@ -106,29 +96,26 @@ jobs:
           ref: ${{ needs.check-and-build.outputs.vllm_commit }}
           path: vllm-source
 
-      # ③ git 子模块镜像代理，避免 github 下载超时
-      - name: Git proxy for submodules
+      - name: Git submodule init
         run: |
           cd vllm-source
-          git config --global url."https://ghcr.nju.edu.cn/github-proxy/https://github.com/".insteadOf "https://github.com/"
           git submodule sync
-          git submodule update --init --recursive || true
+          git submodule update --init --recursive
 
-      # ④ 启用 swap（修复 Text file busy：先关旧 swap 再重建，fallocate 失败自动切 dd）
+      # 独立swap文件，避开系统占用的 /swapfile
       - name: Enable swap memory
         run: |
-          sudo swapoff /swapfile || true
-          sudo rm -f /swapfile
-          if ! sudo fallocate -l 8G /swapfile; then
-            echo "fallocate failed, use dd fallback"
-            sudo dd if=/dev/zero of=/swapfile bs=1G count=8 status=none
+          SWAP_PATH=/home/runner/swap8g
+          rm -f ${SWAP_PATH}
+          if ! sudo fallocate -l 8G ${SWAP_PATH}; then
+            echo "fallocate failed, using dd fallback"
+            sudo dd if=/dev/zero of=${SWAP_PATH} bs=1G count=8 status=none
           fi
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo chmod 600 ${SWAP_PATH}
+          sudo mkswap ${SWAP_PATH}
+          sudo swapon ${SWAP_PATH}
           swapon --show
 
-      # ⑤ Docker 构建环境
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -139,7 +126,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ⑥ 镜像元数据
       - name: Extract metadata
         id: meta
         run: |
@@ -148,7 +134,6 @@ jobs:
           echo "image=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> $GITHUB_OUTPUT
           echo "tag=${VERSION}" >> $GITHUB_OUTPUT
 
-      # ⑦ 构建并推送（源码在 context 的 vllm-source/ 下，由 Dockerfile 编译）
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -161,7 +146,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ⑧ 构建摘要
       - name: Summary
         run: |
           echo "### Docker Image Built (from source)" >> $GITHUB_STEP_SUMMARY
