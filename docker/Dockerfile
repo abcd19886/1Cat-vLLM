@@ -454,7 +454,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 #################### CSRC BUILD IMAGE ####################
 
-
+ARG BUILD_EP_KERNELS="OFF"
 #################### EXTENSIONS BUILD IMAGE ####################
 # Build DeepEP - runs in PARALLEL with csrc-build
 # This stage is independent and doesn't affect csrc cache
@@ -474,14 +474,16 @@ COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.
 ARG DEEPEP_COMMIT_HASH=2718490
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
-    mkdir -p /tmp/ep_kernels_workspace/dist && \
-    export TORCH_CUDA_ARCH_LIST='7.0' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    if [ "${BUILD_EP_KERNELS}" = "ON" ]; then \
+        mkdir -p /tmp/ep_kernels_workspace/dist && \
+        export MAX_JOBS=2 && \
+        export TORCH_CUDA_ARCH_LIST='8.0;9.0' && \
+        /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            --deepep-ref "73b6ea4"; \
+    fi
+
 #################### EXTENSIONS BUILD IMAGE ####################
 
 
@@ -846,18 +848,26 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    # collect whl list
+    && VLLM_WHEELS="dist/*.whl" \
+    && FLASH_V100_WHEELS="" \
+    && if compgen -G "flash-attn-v100-dist/*.whl" > /dev/null; then \
+         FLASH_V100_WHEELS="flash-attn-v100-dist/*.whl"; \
+       fi \
+    && ALL_WHEELS="${FLASH_V100_WHEELS} ${VLLM_WHEELS}" \
+    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
-        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        && uv pip install --system ${ALL_WHEELS} --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         echo "Installing vLLM..." \
-        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        && uv pip install --system ${ALL_WHEELS} --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
+
 
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
