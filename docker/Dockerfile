@@ -423,15 +423,20 @@ ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
-        # Clean any existing CMake artifacts
+        set -x; \
+        # ========== 把原来生成dg_pythons.txt的代码复制到这里 ==========
+        python3 -c "import sys; print(sys.executable)" > /tmp/dg_pythons.txt; \
+        cat /tmp/dg_pythons.txt; \
+        # =============================================================
         rm -rf .deps && \
         mkdir -p .deps && \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
         export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) && \
-        python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
+        python3 -u setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 2>&1; \
     fi
+
 
 #################### CSRC BUILD IMAGE ####################
 
