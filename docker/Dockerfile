@@ -456,11 +456,32 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 
 #################### EXTENSIONS BUILD IMAGE ####################
-# DeepEP requires sm_90+, V100(sm70) skip build entirely
+# Build DeepEP - runs in PARALLEL with csrc-build
+# This stage is independent and doesn't affect csrc cache
 FROM base AS extensions-build
+ARG CUDA_VERSION
+
+# This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE=copy
+
 WORKDIR /workspace
-# create empty dist folder，给后续COPY占位，不编译DeepEP
-RUN mkdir -p /tmp/ep_kernels_workspace/dist
+
+# Build DeepEP wheels
+COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
+# Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
+ARG DEEPEP_COMMIT_HASH=73b6ea4
+ARG NVSHMEM_VER
+RUN --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /tmp/ep_kernels_workspace/dist && \
+    export TORCH_CUDA_ARCH_LIST='7.0' && \
+    /tmp/install_python_libraries.sh \
+        --workspace /tmp/ep_kernels_workspace \
+        --mode wheel \
+        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
+        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
+    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
 #################### EXTENSIONS BUILD IMAGE ####################
 
 
@@ -848,8 +869,8 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # Install EP kernels wheels (DeepEP) that have been built in the `build` stage
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    bash -c 'uv pip install --system ep_kernels/dist/*.whl --verbose --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d ".")'
-
+    uv pip install --system ep_kernels/dist/*.whl --verbose \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # Download FlashInfer precompiled cubins AFTER all pip installs are done.
 # This must run after the vLLM wheel and EP kernels installs above, because
