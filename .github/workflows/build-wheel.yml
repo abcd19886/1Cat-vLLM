@@ -20,6 +20,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VLLM_REPO: abcd19886/1Cat-vLLM
+  export TORCH_CUDA_ARCH_LIST="7.0"
 
 jobs:
   check-and-build:
@@ -146,6 +147,8 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            TORCH_CUDA_ARCH_LIST="7.0"
 
       - name: Summary
         run: |
