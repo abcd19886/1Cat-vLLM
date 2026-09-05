@@ -31,7 +31,7 @@ ARG UBUNTU_VERSION=22.04
 # private registries that use a different repository naming conventions.
 #
 # Example:
-# docker build --build-arg BUILD_BASE_IMAGE=registry.acme.org/mirror/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
+# docker build --build-arg BUILD_BASE_IMAGE=registry.acme.org/mirror/nvidia/cuda:${}-devel-ubuntu20.04
 
 # Important: We build with an old version of Ubuntu to maintain broad
 # compatibility with other Linux OSes. The main reason for this is that the
