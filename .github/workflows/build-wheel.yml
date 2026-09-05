@@ -11,25 +11,20 @@ on:
         description: 'Docker image tag (e.g. v1.5.0). Leave empty to auto-detect from git tag.'
         required: false
         type: string
-
 permissions:
   packages: write
   contents: read
-
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VLLM_REPO: abcd19886/1Cat-vLLM
-
 jobs:
   check-and-build:
-    # runs-on: ubuntu-latest
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version_tag: ${{ steps.check.outputs.version_tag }}
       vllm_commit: ${{ steps.check.outputs.vllm_commit }}
-
     steps:
       - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v4
@@ -38,28 +33,23 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: true
           fetch-depth: 0
-
       - name: Determine version & check image
         id: check
         run: |
           COMMIT=$(git rev-parse --short HEAD)
           echo "1Cat-vLLM commit: ${COMMIT}"
-
           if [ -n "${{ inputs.image_tag }}" ]; then
             VERSION="${{ inputs.image_tag }}"
           else
             VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "dev-${COMMIT}")
           fi
           echo "Image tag: ${VERSION}"
-
           IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
           echo "Checking if ${IMAGE_TAG} already exists..."
-
           RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://ghcr.io/v2/$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" \
             -H "Accept: application/vnd.oci.image.manifest.v1+json" 2>/dev/null || echo "000")
-
           if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "401" ]; then
             TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:${{ env.IMAGE_NAME }}:pull" \
               | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
@@ -70,7 +60,6 @@ jobs:
                 "https://ghcr.io/v2/$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" 2>/dev/null || echo "000")
             fi
           fi
-
           if [ "$RESPONSE" = "200" ]; then
             echo "Image ${IMAGE_TAG} already exists. Skipping build."
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -78,54 +67,50 @@ jobs:
             echo "Image ${IMAGE_TAG} does not exist. Will build from source."
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
-
           echo "version_tag=${VERSION}" >> $GITHUB_OUTPUT
           echo "vllm_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build:
     needs: check-and-build
     if: needs.check-and-build.outputs.should_build == 'true'
-    # runs-on: ubuntu-latest
-    runs-on: self-hosted
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout main repo
         uses: actions/checkout@v4
-
       - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v4
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ needs.check-and-build.outputs.vllm_commit }}
           path: vllm-source
-
       - name: Git submodule init
         run: |
           cd vllm-source
           git submodule sync
           git submodule update --init --recursive
 
-      # 独立swap文件，避开系统占用的 /swapfile
-      #- name: Enable swap memory
-      #  run: |
-      #    SWAP_PATH=/home/runner/swap8g
-      #    rm -f ${SWAP_PATH}
-      #    if ! sudo fallocate -l 8G ${SWAP_PATH}; then
-      #      echo "fallocate failed, using dd fallback"
-      #      sudo dd if=/dev/zero of=${SWAP_PATH} bs=1G count=8 status=none
-      #    fi
-      #    sudo chmod 600 ${SWAP_PATH}
-      #    sudo mkswap ${SWAP_PATH}
-     #     sudo swapon ${SWAP_PATH}
-     #     swapon --show
-     # - name: Free disk space
-     #   run: |
-     #     df -h
-     #     sudo rm -rf /usr/share/dotnet
-     #     sudo rm -rf /opt/ghc
-     #     sudo rm -rf /opt/hostedtoolcache/CodeQL
-     #     sudo apt clean
-     #     df -h
+      - name: Enable swap memory
+        run: |
+          SWAP_PATH=/home/runner/swap8g
+          rm -f ${SWAP_PATH}
+          if ! sudo fallocate -l 8G ${SWAP_PATH}; then
+            echo "fallocate failed, using dd fallback"
+            sudo dd if=/dev/zero of=${SWAP_PATH} bs=1G count=8 status=none
+          fi
+          sudo chmod 600 ${SWAP_PATH}
+          sudo mkswap ${SWAP_PATH}
+          sudo swapon ${SWAP_PATH}
+          swapon --show
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt clean
+          df -h
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
