@@ -806,21 +806,17 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
-    && set -euo pipefail \
-    && WHEEL_LIST=() \
-    && if compgen -G "dist/*.whl" >/dev/null; then WHEEL_LIST+=(dist/*.whl); fi \
-    && if compgen -G "flash-attn-v100-dist/*.whl" >/dev/null; then WHEEL_LIST+=(flash-attn-v100-dist/*.whl); fi \
-    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
-          --index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')" \
-        && echo "Installing vLLM wheels: ${WHEEL_LIST[*]}" \
-        && uv pip install --system "${WHEEL_LIST[@]}" --verbose \
-          --extra-index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        && echo "Installing vLLM..." \
+        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
-        echo "Installing vLLM wheels: ${WHEEL_LIST[*]}" \
-        && uv pip install --system "${WHEEL_LIST[@]}" --verbose \
-          --extra-index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
+        echo "Installing vLLM..." \
+        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
 
