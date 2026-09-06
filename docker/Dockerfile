@@ -233,7 +233,7 @@ COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
 # FlashInfer wheels/cubins target newer GPUs and are not needed on SM70.
-RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' requirements/cuda.txt; \
@@ -513,7 +513,7 @@ COPY --from=csrc-build /workspace/dist /precompiled-wheels
 COPY . .
 # Keep the wheel metadata consistent with the SM70 runtime requirements and
 # remove extension targets that are not used by YOLO-World.
-RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt && \
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt && \
     sed -i \
         '/ext_modules.append(CMakeExtension(name="vllm._moe_C"))/d' \
         setup.py && \
@@ -671,6 +671,9 @@ RUN apt-get update -y \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+        build-essential \
+        gcc \
+        g++ \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
@@ -753,7 +756,7 @@ COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
 # FlashInfer wheels/cubins target newer GPUs and are not needed because this
 # image uses the bundled SM70 FlashAttention implementation.
-RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' /tmp/requirements-cuda.txt
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' /tmp/requirements-cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
