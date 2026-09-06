@@ -537,16 +537,21 @@ class cmake_build_ext(build_ext):
         if _is_cuda() or _is_hip():
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
-            # build
-            print(
-                f"Copying {self.build_lib}/vllm/third_party/triton_kernels "
-                "to vllm/third_party/triton_kernels"
+            # build. The triton_kernels extension is optional and is disabled in
+            # the SM70 Docker build, so the build_lib directory may not exist.
+            triton_kernels_build = os.path.join(
+                self.build_lib, "vllm", "third_party", "triton_kernels"
             )
-            shutil.copytree(
-                f"{self.build_lib}/vllm/third_party/triton_kernels",
-                "vllm/third_party/triton_kernels",
-                dirs_exist_ok=True,
-            )
+            if os.path.exists(triton_kernels_build):
+                print(
+                    f"Copying {triton_kernels_build} "
+                    "to vllm/third_party/triton_kernels"
+                )
+                shutil.copytree(
+                    triton_kernels_build,
+                    "vllm/third_party/triton_kernels",
+                    dirs_exist_ok=True,
+                )
 
         if _is_cuda():
             # copy vendored deep_gemm package from build_lib to source tree
