@@ -135,20 +135,30 @@ jobs:
           context: .
           file: ./docker/Dockerfile
           push: true
-          debug: true
           # no-cache: true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=min
+          # mode=max (not min): export the cache even when the build fails,
+          # so sccache-compiled objects from finished steps survive a later
+          # packaging failure and are reused by the next build.
+          cache-to: type=gha,mode=max
           # NOTE: do NOT wrap the value in quotes. docker/build-push-action
           # passes build-arg values verbatim, so `TORCH_CUDA_ARCH_LIST="7.0"`
           # would leak literal quote characters into the env var and make
           # PyTorch's CMake arch parser fail with
           # "Found Unknown CUDA Architecture Name: \"7.0\"".
+          # NOTE: the Dockerfile currently pins SM70 (TORCH_CUDA_ARCH_LIST=7.0
+          # and CMAKE_CUDA_ARCHITECTURES=70) in both build paths, so this arg
+          # is informational until the Dockerfile is changed.
+          # USE_SCCACHE=1 enables sccache; SCCACHE_BUCKET_NAME= (empty)
+          # disables the S3 remote cache so the BuildKit cache mount (persisted
+          # via cache-to: type=gha) is the only cache backend.
           build-args: |
-            TORCH_CUDA_ARCH_LIST="7.0;9.0"
+            TORCH_CUDA_ARCH_LIST=7.0;9.0
+            USE_SCCACHE=1
+            SCCACHE_BUCKET_NAME=
 
       - name: Summary
         run: |
