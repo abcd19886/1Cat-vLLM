@@ -434,6 +434,26 @@ class cmake_build_ext(build_ext):
         except OSError as e:
             raise RuntimeError("Cannot find CMake executable") from e
 
+        # Normalize TORCH_CUDA_ARCH_LIST: Docker build-args such as
+        # `TORCH_CUDA_ARCH_LIST="7.0"` can leak literal quote characters into
+        # the environment, which PyTorch's CMake arch parser rejects with
+        # "Found Unknown CUDA Architecture Name". Strip stray surrounding
+        # quotes/whitespace from each entry so the build is robust to that.
+        arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        if arch_list is not None:
+            normalized = ";".join(
+                part.strip().strip('"').strip("'").strip()
+                for part in arch_list.split(";")
+                if part.strip().strip('"').strip("'").strip()
+            )
+            if normalized != arch_list:
+                logger.info(
+                    "Normalized TORCH_CUDA_ARCH_LIST: %r -> %r",
+                    arch_list,
+                    normalized,
+                )
+                os.environ["TORCH_CUDA_ARCH_LIST"] = normalized
+
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)

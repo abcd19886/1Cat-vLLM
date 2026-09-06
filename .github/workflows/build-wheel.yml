@@ -142,8 +142,13 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=min
+          # NOTE: do NOT wrap the value in quotes. docker/build-push-action
+          # passes build-arg values verbatim, so `TORCH_CUDA_ARCH_LIST="7.0"`
+          # would leak literal quote characters into the env var and make
+          # PyTorch's CMake arch parser fail with
+          # "Found Unknown CUDA Architecture Name: \"7.0\"".
           build-args: |
-            TORCH_CUDA_ARCH_LIST="7.0"
+            TORCH_CUDA_ARCH_LIST=7.0
 
       - name: Summary
         run: |
