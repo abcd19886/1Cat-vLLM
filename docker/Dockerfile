@@ -806,23 +806,25 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
-    && VLLM_WHEELS="dist/*.whl" \
-    && FLASH_V100_WHEELS="" \
-    && if ls flash-attn-v100-dist/*.whl > /dev/null 2>&1; then \
-         FLASH_V100_WHEELS="flash-attn-v100-dist/*.whl"; \
-       fi \
-    && ALL_WHEELS="${FLASH_V100_WHEELS} ${VLLM_WHEELS}" \
-    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
-        echo "Installing torch nightly..." \
-        && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
-        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-        && echo "Installing vLLM..." \
-        && uv pip install --system ${ALL_WHEELS} --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    set -e; \
+    VLLM_WHEELS="dist/*.whl"; \
+    FLASH_V100_WHEELS=""; \
+    if ls flash-attn-v100-dist/*.whl > /dev/null 2>&1; then \
+        FLASH_V100_WHEELS="flash-attn-v100-dist/*.whl"; \
+    fi; \
+    ALL_WHEELS="${FLASH_V100_WHEELS} ${VLLM_WHEELS}"; \
+    CUDA_TAG="cu$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr -d '.')"; \
+    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+        echo "Installing torch nightly..."; \
+        uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
+            --index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${CUDA_TAG}"; \
+        echo "Installing vLLM..."; \
+        uv pip install --system ${ALL_WHEELS} --verbose \
+            --extra-index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${CUDA_TAG}"; \
     else \
-        echo "Installing vLLM..." \
-        && uv pip install --system ${ALL_WHEELS} --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        echo "Installing vLLM..."; \
+        uv pip install --system ${ALL_WHEELS} --verbose \
+            --extra-index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/${CUDA_TAG}"; \
     fi
 
 
