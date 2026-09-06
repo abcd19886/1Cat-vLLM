@@ -148,7 +148,7 @@ jobs:
           # PyTorch's CMake arch parser fail with
           # "Found Unknown CUDA Architecture Name: \"7.0\"".
           build-args: |
-            TORCH_CUDA_ARCH_LIST=7.0
+            TORCH_CUDA_ARCH_LIST="7.0;9.0"
 
       - name: Summary
         run: |
