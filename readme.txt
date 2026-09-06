@@ -16,5 +16,12 @@ Fine-grained PAT 无 Actions 写权限 → dispatch 返回 403。用户改提供
 ⑦ 用户打断（05:21）· 新诉求：复用成功构建产物
 “每次失败后都要重新构建……下次构建能否复用已经成功的构建，不然太花时间了” → 指向启用 USE_SCCACHE（sccache 缓存），避免每次 71 分钟全量重编
 当前状态：构建未成功（卡在 wheel 打包）；修复②待提交并重新触发；待办：①提交修复② ②重新构建验证 ③启用 sccache 缓存复用编译产物 ④（次要）pre-commit 既有失败：workflow lint（run: 块、debug: true）与 docker/versions.json 与 Dockerfile 不同步
-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这是github完整权限的Personal access tokens (classic)
-每次失败后都要重新构建，97 CUDA targets compiled successfully等成功后，下次构建能否复用已经成功的构建，不然太花时间了
+
+⑧ Dockerfile 809 行修复（2026-09-06 后续）
+根因：RUN 指令 --mount 参数后紧跟 && 导致 shell 命令以 && 开头，dash 语法错误 exit 2。已修复：改用 set -e; + ; \ 续行，添加 CUDA_TAG 变量避免重复计算。
+
+关于构建缓存：
+- workflow 已启用 cache-from/to: type=gha（GitHub Actions 10GB 缓存）
+- USE_SCCACHE=1 会用 sccache（不是 ccache）缓存编译产物到 /root/.cache/sccache
+- 第一次构建会写入缓存，第二次起只要不改 Dockerfile 就能复用，97 targets 会从缓存读取
+- 监控 sccache 统计：构建日志搜 "sccache --show-stats"，看 Cache hits 数量

@@ -450,7 +450,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
-RUN --mount=type=cache,target=/root/.cache/ccache \
+RUN --mount=type=cache,target=/root/.cache/ccache,id=vllm-ccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
         # Clean any existing CMake artifacts
