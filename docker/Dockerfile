@@ -210,6 +210,8 @@ ENV VLLM_DISABLE_MXFP4_KERNELS=1
 # Keep CUDA compilation memory usage bounded on the build runner.
 ENV MAX_JOBS=2
 ENV NVCC_THREADS=2
+ENV CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=70"
+ENV VERBOSE=1
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
@@ -231,7 +233,7 @@ COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
 # FlashInfer wheels/cubins target newer GPUs and are not needed on SM70.
-RUN sed -i -E '/^[[:space:]]*flashinfer(-python|-cubin)?([<=>[:space:]]|$)/d' requirements/cuda.txt
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' requirements/cuda.txt; \
@@ -318,7 +320,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
 ARG TARGETPLATFORM
-ARG TORCH_CUDA_ARCH_LIST
+ARG TORCH_CUDA_ARCH_LIST=7.0
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 ARG PIP_INDEX_URL UV_INDEX_URL
@@ -363,12 +365,23 @@ COPY flash_qla flash_qla/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 
+# YOLO-World does not use vLLM's MoE or Triton-kernels packages. Do not fetch
+# Triton or compile the large MoE CUDA target on the SM70 build path.
+RUN sed -i \
+        '/ext_modules.append(CMakeExtension(name="vllm._moe_C"))/d' \
+        setup.py && \
+    sed -i \
+        '/ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))/d' \
+        setup.py && \
+    sed -i \
+        '/include(cmake\/external_projects\/triton_kernels.cmake)/d' \
+        CMakeLists.txt
 
 # Limit compiler parallelism to keep SM70 builds within CI memory limits.
-ARG max_jobs=2
+ARG max_jobs=1
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
-ARG nvcc_threads=2
+ARG nvcc_threads=1
 ENV NVCC_THREADS=$nvcc_threads
 
 ARG USE_SCCACHE
@@ -436,6 +449,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
+        export TORCH_CUDA_ARCH_LIST="7.0" && \
+        export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=70 ${CMAKE_ARGS}" && \
+        echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}" && \
+        echo "CMAKE_ARGS=${CMAKE_ARGS}" && \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
 
@@ -484,8 +501,18 @@ WORKDIR /workspace
 # Copy pre-built csrc wheel directly
 COPY --from=csrc-build /workspace/dist /precompiled-wheels
 COPY . .
-# Keep the wheel metadata consistent with the SM70 runtime requirements.
-RUN sed -i -E '/^[[:space:]]*flashinfer(-python|-cubin)?([<=>[:space:]]|$)/d' requirements/cuda.txt
+# Keep the wheel metadata consistent with the SM70 runtime requirements and
+# remove extension targets that are not used by YOLO-World.
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' requirements/cuda.txt && \
+    sed -i \
+        '/ext_modules.append(CMakeExtension(name="vllm._moe_C"))/d' \
+        setup.py && \
+    sed -i \
+        '/ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))/d' \
+        setup.py && \
+    sed -i \
+        '/include(cmake\/external_projects\/triton_kernels.cmake)/d' \
+        CMakeLists.txt
 
 # Drop the pre-built rust frontend binary into the source tree. setup.py
 # detects it and ships it as-is, skipping the local cargo build.
@@ -716,7 +743,7 @@ COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
 # FlashInfer wheels/cubins target newer GPUs and are not needed because this
 # image uses the bundled SM70 FlashAttention implementation.
-RUN sed -i -E '/^[[:space:]]*flashinfer(-python|-cubin)?([<=>[:space:]]|$)/d' /tmp/requirements-cuda.txt
+RUN sed -i -E '/^[[:space:]]*(flashinfer(-python|-cubin)?|apache-tvm-ffi|tilelang|nvidia-cudnn-frontend|nvidia-cutlass-dsl(\[cu13\])?|quack-kernels|humming-kernels(\[cu(12|13)\])?)([<=>[:space:]]|$)/d' /tmp/requirements-cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
