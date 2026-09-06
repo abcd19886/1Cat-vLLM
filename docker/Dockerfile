@@ -408,7 +408,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
+# The sccache local cache lives in a BuildKit cache mount so it persists in the
+# GHA cache (see cache-to: type=gha in build-wheel.yml) and is reused by the
+# next build. Pass SCCACHE_BUCKET_NAME= (empty) to skip the S3 remote cache.
 RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=cache,target=/root/.cache/sccache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         echo "Installing sccache..." \
@@ -423,15 +427,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
         && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl \
         && if [ ! -z ${SCCACHE_ENDPOINT} ] ; then export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} ; fi \
-        && export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} \
+        && if [ ! -z ${SCCACHE_BUCKET_NAME} ] ; then export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} ; fi \
         && export SCCACHE_REGION=${SCCACHE_REGION_NAME} \
         && export SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS} \
+        && export SCCACHE_DIR=/root/.cache/sccache \
+        && export SCCACHE_MAX_SIZE=8G \
         && export SCCACHE_IDLE_TIMEOUT=0 \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
+        && export TORCH_CUDA_ARCH_LIST="7.0" \
+        && export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=70 ${CMAKE_ARGS}" \
+        && echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}" \
+        && echo "CMAKE_ARGS=${CMAKE_ARGS}" \
         && sccache --show-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
         && sccache --show-stats; \
