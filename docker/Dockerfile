@@ -124,7 +124,7 @@ ENV VIRTUAL_ENV="/opt/venv"
 
 
 # 编译并发数，防止CI内存爆炸
-ENV MAX_JOBS=2
+ENV max_jobs=4
 # Install system dependencies including build tools.
 # The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
 # (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
@@ -208,7 +208,7 @@ ENV CUTLASS_NVCC_ARCHS="70"
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ENV VLLM_DISABLE_MXFP4_KERNELS=1
 # Keep CUDA compilation memory usage bounded on the build runner.
-ENV MAX_JOBS=2
+ENV max_jobs=4
 ENV NVCC_THREADS=2
 ENV CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=70"
 ENV VERBOSE=1
@@ -378,7 +378,7 @@ RUN sed -i \
         CMakeLists.txt
 
 # Limit compiler parallelism to keep SM70 builds within CI memory limits.
-ARG max_jobs=1
+ARG max_jobs=4
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
 ARG nvcc_threads=1

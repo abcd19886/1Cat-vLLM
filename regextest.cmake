@@ -1,0 +1,8 @@
+set(TESTS "7.0" "7.5" "8.0" "8.6" "9.0" "10.0" "70" "7.0+PTX")
+foreach(t IN LISTS TESTS)
+  if(t MATCHES "^([0-9]+\.[0-9][af]?(\([0-9]+\.[0-9]\))?)$")
+    message(STATUS "MATCH   '${t}' -> bin=${CMAKE_MATCH_1}")
+  else()
+    message(STATUS "NOMATCH '${t}'")
+  endif()
+endforeach()
