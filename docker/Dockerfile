@@ -799,14 +799,16 @@ ARG PYTORCH_NIGHTLY
 
 # Install vLLM wheel first, so that torch etc will be installed.
 # Check whether to install torch nightly instead of release for this build.
+# NOTE: no comment lines inside the RUN continuation below — a `#` line after
+# a backslash-continued line breaks the instruction and the shell command
+# starts with a dangling `&&` (dash: Syntax error).
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
-    # collect whl list
     && VLLM_WHEELS="dist/*.whl" \
     && FLASH_V100_WHEELS="" \
-    && if compgen -G "flash-attn-v100-dist/*.whl" > /dev/null; then \
+    && if ls flash-attn-v100-dist/*.whl > /dev/null 2>&1; then \
          FLASH_V100_WHEELS="flash-attn-v100-dist/*.whl"; \
        fi \
     && ALL_WHEELS="${FLASH_V100_WHEELS} ${VLLM_WHEELS}" \
