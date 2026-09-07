@@ -150,15 +150,14 @@ jobs:
           # would leak literal quote characters into the env var and make
           # PyTorch's CMake arch parser fail with
           # "Found Unknown CUDA Architecture Name: \"7.0\"".
-          # NOTE: the Dockerfile currently pins SM70 (TORCH_CUDA_ARCH_LIST=7.0
-          # and CMAKE_CUDA_ARCHITECTURES=70) in both build paths, so this arg
-          # is informational until the Dockerfile is changed.
+          # This build targets only SM70 (V100 GPUs) with CUDA 12.8.
           # USE_SCCACHE=1 enables sccache; SCCACHE_BUCKET_NAME= (empty)
           # disables the S3 remote cache so the BuildKit cache mount (persisted
           # via cache-to: type=gha) is the only cache backend.
           build-args: |
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=
+            torch_cuda_arch_list=7.0
 
       - name: Summary
         run: |
