@@ -434,6 +434,26 @@ class cmake_build_ext(build_ext):
         except OSError as e:
             raise RuntimeError("Cannot find CMake executable") from e
 
+        # Normalize TORCH_CUDA_ARCH_LIST: Docker build-args such as
+        # `TORCH_CUDA_ARCH_LIST="7.0"` can leak literal quote characters into
+        # the environment, which PyTorch's CMake arch parser rejects with
+        # "Found Unknown CUDA Architecture Name". Strip stray surrounding
+        # quotes/whitespace from each entry so the build is robust to that.
+        arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        if arch_list is not None:
+            normalized = ";".join(
+                part.strip().strip('"').strip("'").strip()
+                for part in arch_list.split(";")
+                if part.strip().strip('"').strip("'").strip()
+            )
+            if normalized != arch_list:
+                logger.info(
+                    "Normalized TORCH_CUDA_ARCH_LIST: %r -> %r",
+                    arch_list,
+                    normalized,
+                )
+                os.environ["TORCH_CUDA_ARCH_LIST"] = normalized
+
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
@@ -517,16 +537,21 @@ class cmake_build_ext(build_ext):
         if _is_cuda() or _is_hip():
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
-            # build
-            print(
-                f"Copying {self.build_lib}/vllm/third_party/triton_kernels "
-                "to vllm/third_party/triton_kernels"
+            # build. The triton_kernels extension is optional and is disabled in
+            # the SM70 Docker build, so the build_lib directory may not exist.
+            triton_kernels_build = os.path.join(
+                self.build_lib, "vllm", "third_party", "triton_kernels"
             )
-            shutil.copytree(
-                f"{self.build_lib}/vllm/third_party/triton_kernels",
-                "vllm/third_party/triton_kernels",
-                dirs_exist_ok=True,
-            )
+            if os.path.exists(triton_kernels_build):
+                print(
+                    f"Copying {triton_kernels_build} "
+                    "to vllm/third_party/triton_kernels"
+                )
+                shutil.copytree(
+                    triton_kernels_build,
+                    "vllm/third_party/triton_kernels",
+                    dirs_exist_ok=True,
+                )
 
         if _is_cuda():
             # copy vendored deep_gemm package from build_lib to source tree

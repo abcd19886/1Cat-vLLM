@@ -70,6 +70,7 @@ jobs:
           fi
           echo "version_tag=${VERSION}" >> $GITHUB_OUTPUT
           echo "vllm_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
   build:
     needs: check-and-build
     if: needs.check-and-build.outputs.should_build == 'true'
@@ -88,6 +89,7 @@ jobs:
           cd vllm-source
           git submodule sync
           git submodule update --init --recursive
+
       - name: Enable swap memory
         run: |
           SWAP_PATH=/home/runner/swap8g
@@ -100,6 +102,7 @@ jobs:
           sudo mkswap ${SWAP_PATH}
           sudo swapon ${SWAP_PATH}
           swapon --show
+
       - name: Free disk space
         run: |
           df -h
@@ -108,6 +111,7 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo apt clean
           df -h
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -125,6 +129,7 @@ jobs:
           IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           echo "image=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> $GITHUB_OUTPUT
           echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -154,6 +159,7 @@ jobs:
           build-args: |
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=
+
       - name: Summary
         run: |
           echo "### Docker Image Built (from source)" >> $GITHUB_STEP_SUMMARY
