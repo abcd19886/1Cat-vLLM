@@ -503,26 +503,49 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor,
+    batch_size: int = 1,
+    *,
+    partial_dtype: torch.dtype = torch.float16,
+) -> _GroupedVerifyWorkspace:
+    query_len = q.shape[0] // batch_size
+    max_query_tokens = 16 if query_len > 8 else 8
+    grouped_splits = 640 // max_query_tokens
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
+        batch_size,
+        max_query_tokens,
         q.dtype,
+        partial_dtype,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
     )
     if workspace is None:
+        partial_out_shape = (
+            (grouped_splits, max_query_tokens, 6, 256)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6, 256)
+        )
+        partial_lse_shape = (
+            (grouped_splits, max_query_tokens, 6)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6)
+        )
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (80, 8, 6, 256),
-                dtype=torch.float16,
+                partial_out_shape,
+                dtype=partial_dtype,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                (*partial_lse_shape, 2)
+                if partial_dtype == torch.float32
+                else partial_lse_shape,
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -1040,6 +1063,67 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     return int(get_max_query_tokens())
 
 
+def flash_attn_grouped_verify_request_major_abi_version() -> int:
+    """Return zero for binaries that only support single-request grouping."""
+    get_abi_version = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_request_major_abi_version",
+        None,
+    )
+    return 0 if get_abi_version is None else int(get_abi_version())
+
+
+def flash_attn_grouped_e4m3_fp32_available() -> bool:
+    version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
+    return (
+        hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+        and callable(version)
+        and int(version()) >= 3
+    )
+
+
+def flash_attn_grouped_e4m3_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Experimental E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+
+    Row lengths are authoritative GPU metadata, not inferred from padded Q.
+    Zero lengths produce zero outputs. All positive lengths must fit the
+    block table, whose entries must address valid physical pages. This is
+    not an independent-request batch API. QK/PV and partial storage are FP32;
+    Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    Precision revision 3 retains FP32 numerators and separate max/sum until
+    the final normalization, as well as compensated QK/P and tile-local PV.
+    """
+    if not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 3"
+        )
+    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        float(k_scale),
+        float(v_scale),
+    )
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1053,12 +1137,13 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
 ) -> torch.Tensor:
-    """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+    """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
+    Each request has one block-table row and a uniform contiguous query span.
     The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
-    uses two three-head groups, retaining 48 rows per CTA and the same workspace
-    byte count. Workspaces are stream-local and CUDA-graph safe.
+    paged-KV scan across a packed GQA group. Single-request q16 uses two
+    three-head groups; batched requests use request-major q8 groups. Workspaces
+    are stream- and batch-local and CUDA-graph safe.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1066,13 +1151,7 @@ def flash_attn_grouped_verify_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q)
-    if q.shape[0] > 8:
-        partial_out = workspace.partial_out.view(40, 16, 6, 256)
-        partial_lse = workspace.partial_lse.view(40, 16, 6)
-    else:
-        partial_out = workspace.partial_out
-        partial_lse = workspace.partial_lse
+    workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
     return flash_attn_v100_cuda.grouped_verify_paged_fwd(
         q,
         k_cache,
@@ -1080,8 +1159,8 @@ def flash_attn_grouped_verify_paged(
         out,
         block_table,
         seq_lens,
-        partial_out,
-        partial_lse,
+        workspace.partial_out,
+        workspace.partial_lse,
         float(softmax_scale),
         kv_cache_dtype,
         float(k_scale),
@@ -1436,6 +1515,38 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def fp8_e4m3_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand explicit E4M3 bytes; this does not enable a backend route.
+
+    Positive sequence lengths and physical block IDs must be within the
+    supplied cache/table capacity. Only the live prefix and its 16-token
+    padding are written; the remaining workspace is untouched.
+    """
+    op = getattr(flash_attn_v100_cuda, "fp8_e4m3_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the explicit E4M3 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
 def fp8_e5m2_paged_kv_to_fp16(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -1694,6 +1805,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

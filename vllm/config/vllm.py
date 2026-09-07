@@ -218,6 +218,49 @@ def _is_sm70_qwen38_nomtp_dual_compile_contract(
     )
 
 
+def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
+    """Local device assignment used by UniProc/Multiproc and GPUWorker.
+
+    Visibility is not participation: unused devices must not change engine
+    defaults. Ray/custom placement is not known here, so preserve the legacy
+    device-zero decision for those executors instead of guessing their ranks.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or current_platform.device_count() == 0:
+        return ()
+    parallel = cfg.parallel_config
+    backend = parallel.distributed_executor_backend
+    if backend == "external_launcher":
+        return (int(os.environ.get("LOCAL_RANK", "0")),)
+    if backend not in (None, "uni", "mp") or parallel.data_parallel_backend == "ray":
+        return (0,)
+    start = 0
+    if parallel.world_size == 1:
+        device = cfg.device_config.device
+        if isinstance(device, torch.device) and device.index is not None:
+            start = device.index
+    if parallel.nnodes_within_dp == 1:
+        dp_rank = parallel.data_parallel_rank_local
+        if dp_rank is None:
+            dp_rank = parallel.data_parallel_index
+        start += (
+            dp_rank * parallel.tensor_parallel_size * parallel.pipeline_parallel_size
+        )
+    return tuple(range(start, start + parallel.local_world_size))
+
+
+def _any_participating_device_is_capability(
+    cfg: "VllmConfig", capability: tuple[int, int]
+) -> bool:
+    from vllm.platforms import current_platform
+
+    return any(
+        current_platform.is_device_capability(capability, device_id=device_id)
+        for device_id in _participating_cuda_device_ids(cfg)
+    )
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -572,10 +615,15 @@ def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
     from vllm.platforms import current_platform
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    devices = _participating_cuda_device_ids(cfg)
+    if not devices or not all(
+        current_platform.is_device_capability((7, 0), device_id=device_id)
+        for device_id in devices
     ):
-        raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
+        raise ValueError(
+            "prefix_anchored_decode_window requires an NVIDIA SM70 GPU "
+            "for every participating rank"
+        )
 
     model_config = cfg.model_config
     if model_config is None:
@@ -1621,7 +1669,7 @@ class VllmConfig:
             self.parallel_config,
             is_sm70=(
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
             ),
         )
         sm70_glm5_dflash_tp8_pp1_verifier = (
@@ -1631,7 +1679,7 @@ class VllmConfig:
                 self.parallel_config,
                 is_sm70=(
                     current_platform.is_cuda()
-                    and current_platform.is_device_capability((7, 0))
+                    and _any_participating_device_is_capability(self, (7, 0))
                 ),
             )
         )
@@ -1641,7 +1689,7 @@ class VllmConfig:
             self.parallel_config,
             is_sm70=(
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
             ),
         )
 
@@ -1658,8 +1706,8 @@ class VllmConfig:
             )
 
         if envs.VLLM_SM70_USE_BREAKABLE_CUDAGRAPH:
-            if current_platform.is_cuda() and current_platform.is_device_capability(
-                (7, 0)
+            if current_platform.is_cuda() and _any_participating_device_is_capability(
+                self, (7, 0)
             ):
                 if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
                     os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
@@ -1737,7 +1785,7 @@ class VllmConfig:
             and self.parallel_config.tensor_parallel_size <= 2
             and sm70_fp8_kv_requested
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
@@ -1756,7 +1804,7 @@ class VllmConfig:
             and self.model_config.quantization == "fp8"
             and self.model_config.is_moe
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
             and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
@@ -1778,7 +1826,7 @@ class VllmConfig:
         )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
@@ -1949,7 +1997,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 self.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -2126,7 +2174,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 capture_size = max(
@@ -2181,7 +2229,7 @@ class VllmConfig:
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             )
 

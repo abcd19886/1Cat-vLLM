@@ -681,6 +681,14 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     )
     monkeypatch.setattr(flash_v100, "_try_sm70_fa2_d256_prefill", exact_dense)
     monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+    monkeypatch.setattr(
+        flash_v100,
+        "_uniform_cu_seqlens",
+        lambda *args, **kwargs: (
+            torch.tensor([0, query_len], dtype=torch.int32),
+            torch.tensor([0, seq_len], dtype=torch.int32),
+        ),
+    )
     impl.flash_attn_prefill_paged = unexpected_paged
 
     result = impl._flash_v100_prefill_with_prefix(
@@ -776,8 +784,11 @@ def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
     assert loaded == ["/tmp/stable-fa2.so"]
 
 
-def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
+@pytest.mark.parametrize("v37", [False, True])
+def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", str(int(v37)))
 
     fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
     fake_package = types.ModuleType("vllm.vllm_flash_attn")
@@ -793,6 +804,7 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
     fake_ops = SimpleNamespace(
         _vllm_fa2_C=SimpleNamespace(
             sm70_d256_gqa_architecture_fwd=architecture,
+            sm70_d256_gqa_v37_fwd=architecture,
         )
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
@@ -910,6 +922,7 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
     name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
     query = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
     key = torch.empty((1, 128000, 1, 256), dtype=torch.float16, device="meta")
@@ -1828,6 +1841,128 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert torch.all(output == 1)
 
 
+def test_flash_v100_batched_grouped_workspace_preserves_single_request_layout():
+    from flash_attn_v100.flash_attn_interface import _get_grouped_verify_workspace
+
+    q8 = torch.empty((8, 6, 256), dtype=torch.float16, device="meta")
+    q16 = torch.empty((16, 6, 256), dtype=torch.float16, device="meta")
+    batched = torch.empty((32, 6, 256), dtype=torch.float16, device="meta")
+
+    single_q8 = _get_grouped_verify_workspace(q8, 1)
+    single_q16 = _get_grouped_verify_workspace(q16, 1)
+    batch_q8 = _get_grouped_verify_workspace(batched, 4)
+
+    assert tuple(single_q8.partial_out.shape) == (80, 8, 6, 256)
+    assert tuple(single_q8.partial_lse.shape) == (80, 8, 6)
+    assert tuple(single_q16.partial_out.shape) == (40, 16, 6, 256)
+    assert tuple(single_q16.partial_lse.shape) == (40, 16, 6)
+    assert tuple(batch_q8.partial_out.shape) == (4, 80, 8, 6, 256)
+    assert tuple(batch_q8.partial_lse.shape) == (4, 80, 8, 6)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
+def test_flash_v100_dflash2_batched_grouped_verify_uses_exact_requests(
+    batch_size: int,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    captured: dict[str, object] = {}
+
+    def grouped_verify(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        captured["query"] = query
+        captured["block_table"] = block_table
+        captured["seq_lens"] = seq_lens
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_grouped_verify_paged = grouped_verify
+    query_start_loc = torch.arange(0, (batch_size + 1) * 8, 8, dtype=torch.int32)
+    original_block_table = torch.arange(batch_size * 2, dtype=torch.int32).view(
+        batch_size, 2
+    )
+    original_seq_lens = torch.arange(2056, 2056 + batch_size, dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=batch_size * 8,
+        num_reqs=batch_size,
+        max_query_len=8,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=32768,
+        query_start_loc=query_start_loc,
+        seq_lens=original_seq_lens,
+        block_table=original_block_table,
+    )
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
+    query = torch.zeros((batch_size * 8, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((2, 3296, 1, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+
+    impl.use_dflash2_batched_grouped_verify = False
+    impl.dflash2_grouped_verify_request_major_abi_version = 1
+    assert not impl._dflash2_grouped_verify_allowed(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=batch_size * 8,
+    )
+
+    impl.use_dflash2_batched_grouped_verify = True
+    impl.dflash2_grouped_verify_request_major_abi_version = 0
+    assert not impl._dflash2_grouped_verify_allowed(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=batch_size * 8,
+    )
+
+    impl.dflash2_grouped_verify_request_major_abi_version = 1
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        query_start_loc,
+        original_seq_lens,
+    )
+
+    assert result is output
+    captured_query = captured["query"]
+    captured_block_table = captured["block_table"]
+    captured_seq_lens = captured["seq_lens"]
+    assert isinstance(captured_query, torch.Tensor)
+    assert isinstance(captured_block_table, torch.Tensor)
+    assert isinstance(captured_seq_lens, torch.Tensor)
+    assert captured_query.data_ptr() == query.data_ptr()
+    assert captured_block_table.data_ptr() == original_block_table.data_ptr()
+    assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
+    assert tuple(captured_query.shape) == (batch_size * 8, 6, 256)
+    assert tuple(captured_block_table.shape) == (batch_size, 2)
+    assert tuple(captured_seq_lens.shape) == (batch_size,)
+    assert torch.all(output == 1)
+
+
 def test_flash_v100_dflash2_q16_falls_back_for_q8_native_binary():
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -2232,6 +2367,7 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
     impl = object.__new__(FlashAttnV100Impl)
+    impl.kv_cache_dtype = "fp8_e5m2"
     impl.scale = 256**-0.5
     bridge_calls = []
     exact_calls = []
@@ -2308,6 +2444,8 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
 
 def test_flash_v100_fp8_prefill_bridge_workspace_oom_falls_back(monkeypatch):
     from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     key_cache = torch.zeros((1, 1568, 1, 33), dtype=torch.uint8)
     mod._fp8_prefill_bridge_workspaces.clear()
@@ -3002,3 +3140,67 @@ def test_flash_v100_fp8_kv_route_summary_counts_repeated_hits(monkeypatch):
     assert mod._route_counts["fp8_kv_decode_scalar_paged"] == 2
     assert mod._route_counts["fp8_kv_prefill"] == 1
     assert mod._route_counts["fp8_kv_prefill_prefix"] == 1
+
+
+@pytest.mark.parametrize("mode", ["selected", "off", "batch2"])
+def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    calls = []
+    routes: list[str] = []
+
+    def grouped(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["out"].fill_(3)
+
+    def scalar(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["out"].fill_(2)
+
+    instance = SimpleNamespace(
+        flash_attn_grouped_e4m3_fp32_paged=None if mode == "off" else grouped,
+        kv_cache_dtype="fp8_e4m3",
+        use_smallq_decode_xqa=True,
+        scale=0.0625,
+        _flash_v100_window_size=lambda causal: (-1, -1),
+        _smallq_decode_xqa_allowed=lambda *args, **kwargs: False,
+        _call_flash_attn_decode_paged=scalar,
+    )
+    q = torch.empty((5, 6, 256), dtype=torch.float16)
+    k = torch.empty((1, 848, 1, 256), dtype=torch.uint8)
+    table = torch.zeros((5, 310), dtype=torch.int32)
+    lengths = torch.tensor([8193, 8194, 8195, 0, 0], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        block_table=table[:1],
+        seq_lens=torch.ones(2 if mode == "batch2" else 1, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=1.25)
+    out = torch.empty_like(q)
+    monkeypatch.setattr(mod, "_record_route", routes.append)
+    mod.FlashAttnV100Impl._call_flash_attn_smallq_decode_paged(
+        instance,
+        layer,
+        q,
+        k,
+        k,
+        table,
+        lengths,
+        metadata,
+        out=out,
+        max_seq_len_hint=8195,
+        workspace_seq_capacity_hint=262880,
+        partition_size_hint=None,
+    )
+    assert len(calls) == 1
+    assert calls[0][0][4] is lengths
+    assert calls[0][1]["k_scale"] == 0.5
+    assert calls[0][1]["v_scale"] == 1.25
+    if mode == "selected":
+        assert calls[0][0][3] is metadata.block_table
+        assert routes == ["prefill_smallq_e4m3_grouped_fp32"]
+        assert bool((out == 3).all())
+    else:
+        assert calls[0][0][3] is table
+        assert routes == ["prefill_smallq_decode_scalar"]
+        assert bool((out == 2).all())

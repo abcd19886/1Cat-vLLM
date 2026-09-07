@@ -140,6 +140,12 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
         "compressed_tensors_w8a16_fp8.sm70_ops.fp8_sm70_prepare",
         fake_prepare,
     )
+    # Isolate dispatch from the real packing geometry in this tiny mocked case.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+        "compressed_tensors_w8a16_fp8._sm70_channel_fp8_shape_is_validated",
+        lambda _: True,
+    )
     scheme.process_weights_after_loading(layer)
 
     assert prepare_calls == [((6, 4), (6, 1), 128, False)]

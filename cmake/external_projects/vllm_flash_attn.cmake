@@ -94,6 +94,25 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 FetchContent_MakeAvailable(vllm-flash-attn)
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
+# Keep the precision-qualified SM70 prefill route in the parent repository.
+# Its private CUTLASS visitors have distinct types and do not modify the
+# legacy FA2 headers or operators, which remain available for rollback.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_V37_DIR "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_v37")
+  set(SM70_V37_CUDA_SRCS
+    "${SM70_V37_DIR}/prefill.cu"
+    "${SM70_V37_DIR}/tail.cu"
+    "${SM70_V37_DIR}/bridge.cu")
+  # FA2 is created in a child directory. Source properties must be visible in
+  # that target's scope; setting them only in the parent silently loses SM70.
+  set_source_files_properties(${SM70_V37_CUDA_SRCS}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")
+  target_sources(_vllm_fa2_C PRIVATE
+    ${SM70_V37_CUDA_SRCS}
+    "${SM70_V37_DIR}/register.cpp")
+endif()
+
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)

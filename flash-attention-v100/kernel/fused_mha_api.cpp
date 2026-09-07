@@ -24,10 +24,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("grouped_verify_paged_fwd", &flash_attention_grouped_verify_paged,
         "Exact grouped DFlash2 verification over paged KV cache (Volta)");
+  m.def("grouped_e4m3_fp32_paged_fwd", &flash_attention_grouped_e4m3_fp32_paged,
+        "Opt-in E4M3 small-query attention with FP32 partials and explicit row "
+        "lengths");
+  m.def("grouped_e4m3_fp32_precision_version",
+        &flash_attention_grouped_e4m3_fp32_precision_version,
+        "E4M3 grouped FP32 numerical implementation revision");
   m.attr("grouped_verify_e4m3") = true;
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,
         "Maximum query length supported by grouped DFlash2 verification");
+  m.def("grouped_verify_request_major_abi_version",
+        &flash_attention_grouped_verify_request_major_abi_version,
+        "Request-major grouped DFlash2 forward ABI version");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
   m.def("grouped_sparse_page4_abi_version",
@@ -58,4 +67,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FlashAttention split-KV prefill over paged KV cache (Volta)");
   m.def("fp8_e5m2_paged_kv_to_fp16", &flash_attention_fp8_e5m2_paged_kv_to_fp16,
         "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
+  m.def("fp8_e4m3_paged_kv_to_fp16", &flash_attention_fp8_e4m3_paged_kv_to_fp16,
+        "Expand paged FP8 E4M3 K/V into a preallocated FP16 paged workspace");
 }

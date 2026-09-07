@@ -84,6 +84,43 @@ def _sm70_channel_fp8_qpn8_config(
     return _SM70_CHANNEL_FP8_QPN8_CONFIGS.get((k_dim, n_dim))
 
 
+def _sm70_channel_fp8_shape_is_validated(layer: torch.nn.Module) -> bool:
+    """Require complete SM70 packed output rows and FP8 scale groups.
+
+    PackingImpl<HMMA_884, OPERAND_B> packs 32 output rows, independently of
+    QPN8 tuning or checkpoint identity. Partial N tiles and partial 128-wide
+    K scale groups produce incorrect values with the current dense converter.
+    Preserve generic TurboMind shapes that meet these layout constraints.
+    """
+    n_dim, k_dim = layer.weight.shape
+    return n_dim > 0 and k_dim > 0 and n_dim % 32 == 0 and k_dim % 128 == 0
+
+
+def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
+    """Dequantize channel-FP8 weights to the model dtype, in place.
+
+    Multiply checkpoint scales in FP32, then round once to the model dtype.
+    Only partial packing tiles take this fallback. Bound FP32 scratch to
+    4 MiB (or one row), rather than expanding a whole matrix in FP32.
+    """
+    scale = layer.weight_scale.data.to(torch.float32)
+    if scale.ndim == 1:
+        scale = scale.view(-1, 1)
+    weight = layer.weight.data
+    dequantized = torch.empty_like(weight, dtype=layer.orig_dtype)
+    rows_per_chunk = max(1, (4 * 1024**2) // (max(1, weight.shape[1]) * 4))
+    for start in range(0, weight.shape[0], rows_per_chunk):
+        end = start + rows_per_chunk
+        chunk = weight[start:end].to(torch.float32)
+        chunk.mul_(scale[start:end])
+        dequantized[start:end].copy_(chunk)
+    replace_parameter(layer, "weight", dequantized)
+    for stale in ("weight_scale", "weight_scale_inv", "input_scale"):
+        if stale in layer._parameters:
+            del layer._parameters[stale]
+    layer.sm70_fp8_fp16_dequant = True
+
+
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
     def __init__(
         self,
@@ -271,6 +308,18 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         "Insufficient memory for the SM70 channel-FP8 QPN8 "
                         "prefill workspace; retaining the TurboMind layout."
                     )
+            if not _sm70_channel_fp8_shape_is_validated(layer):
+                # Partial packing tiles are a numerical/layout restriction,
+                # not an absence from the QPN8 performance-tuning table.
+                logger.warning_once(
+                    "SM70 channel-FP8 packing needs full N32/K128 tiles for "
+                    "%s with shape %s; unpacking these weights to %s instead.",
+                    getattr(layer, "prefix", "<unknown>"),
+                    tuple(layer.weight.shape),
+                    layer.orig_dtype,
+                )
+                _sm70_unpack_channel_fp8(layer)
+                return
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 layer.weight, weight_scale, 128, False
             )
@@ -317,6 +366,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "sm70_fp8_fp16_dequant", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
         if getattr(layer, "sm70_fp8_turbomind", False):
             if x.dtype != torch.float16:
                 raise RuntimeError(

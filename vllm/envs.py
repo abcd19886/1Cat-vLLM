@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
     VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = True
+    VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2: bool = False
@@ -171,8 +172,12 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_QPN8_M16: bool = True
+    VLLM_SM70_FP8_QPN8_M32_CHUNKED: bool = True
+    VLLM_SM70_FP8_QPN8_M32_NATIVE: bool = True
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
+    VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -184,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
+    VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -260,6 +266,7 @@ if TYPE_CHECKING:
     VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
     VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
@@ -412,6 +419,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
+    VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = True
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -450,6 +458,9 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
+    VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
+
+    VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
@@ -773,6 +784,9 @@ if TYPE_CHECKING:
     VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
     VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1679,6 +1693,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_QWEN38_QPN_M1": lambda: (
         env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "1", ["0", "1"])() == "1"
     ),
+    # Zero disables chunking; 4096 and 6144 cap the indexed W2 scratch rows.
+    "VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS", "0")
+    ),
     "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))
     ),
@@ -1789,12 +1807,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # online route also stays opt-in because it requantizes checkpoint BF16
     # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
+    # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
+    # a full FP16 matrix before every GEMM.
+    "VLLM_SM70_FP8_QPN8_M16": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M16", "1"))
+    ),
+    # Follow-on B4 experiment: replay the accepted M16 body in contiguous row
+    # chunks through M=32 while retaining the same strict shape allowlist.
+    "VLLM_SM70_FP8_QPN8_M32_CHUNKED": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", "1"))
+    ),
+    # Native dense-only B4 verifier experiment. It keeps the logical split-K
+    # reduction order while one CTA reuses each packed weight tile for M<=32.
+    "VLLM_SM70_FP8_QPN8_M32_NATIVE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_NATIVE", "1"))
+    ),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
     ),
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
     # opt-in until operator, token, task-quality, and matched speed gates pass.
+    # Copy-only optimization of the existing batched fused-input fallback.
+    # Does not opt a model into the separate FP16 GEMV arithmetic path.
+    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))
+    ),
     "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
     ),
@@ -1842,6 +1881,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
+    # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
+    "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE", "1"))
+    ),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
@@ -2303,6 +2347,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ordinary pull path; explicit 0 is the rollback.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
+    ),
+    # Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from the
+    # accepted M8 payload to M16/M32 verifier payloads.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "0"))
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
@@ -2870,6 +2919,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "1"))
+    ),
     "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
         int(
             os.getenv(
@@ -3000,8 +3052,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
     ),
+    # Experimental dense single-request small-Q route; not the DFlash2 q8 gate.
+    "VLLM_FLASH_V100_E4M3_GROUPED_FP32": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1"))
+    ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
+    ),
+    # Keep batched admission independent until the request-major kernel has
+    # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
@@ -4563,6 +4624,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
     ),
+    # Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel rank,
+    # for the part of the FP8 n-gram table that does not stay in device
+    # memory. Unset or "auto": derived from the device headroom left beside
+    # the weights and the KV cache of the requested context.
+    "VLLM_QWEN4EXP_PLE_HOST_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "auto").strip().lower()
+        in ("", "auto")
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
+    ),
+    # Device memory in GiB the automatic PLE placement keeps free for the
+    # activation peak and the CUDA graph pool. Unset: 8 % of the device,
+    # at most 4 GiB.
+    "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "").strip() == ""
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0"))
+    ),
+    # Host memory in GiB the automatic PLE placement leaves untouched for the
+    # engine processes, checkpoint loading and other tenants; the rest is
+    # shared equally by the tensor-parallel ranks that pin the table.
+    # Unset: 25 % of the physical host memory.
+    "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -4833,6 +4921,21 @@ def compile_factors() -> dict[str, object]:
             continue
 
         factors[factor] = normalize_value(raw)
+
+    # Out-of-tree switches. Forks, plugins and out-of-tree backends read
+    # their own VLLM_-prefixed variables straight from os.environ, so this
+    # module never sees them -- yet they select kernels and therefore change
+    # the compiled graph. Left out of the key, a compiled artifact from one
+    # kernel route is silently reused for another; that is the classic
+    # "cached run answers differently" report. Hash whatever is set: an
+    # over-invalidated cache costs a recompile, a wrongly reused one costs
+    # correctness.
+    for name, value in os.environ.items():
+        if not name.startswith("VLLM_"):
+            continue
+        if name in factors or name in ignored_factors:
+            continue
+        factors[name] = normalize_value(value)
 
     ray_noset_env_vars = [
         # Refer to
