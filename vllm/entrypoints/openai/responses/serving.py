@@ -112,6 +112,13 @@ from vllm.utils.collection_utils import as_list
 logger = init_logger(__name__)
 
 
+def _default_tool_parser_for_model(model_name: str | None) -> str | None:
+    """Return the native tool parser for Qwen3 Responses requests."""
+    if model_name and "qwen3" in model_name.lower():
+        return "hermes"
+    return None
+
+
 def _extract_allowed_tools_from_mcp_requests(
     tools: list[Tool],
 ) -> dict[str, list[str] | None]:
@@ -186,10 +193,14 @@ class OpenAIServingResponses(OpenAIServing):
 
         # Set up the unified parser - either a unified parser or fall back to
         # separate parsers accessed through the parser interface
+        effective_tool_parser = tool_parser or _default_tool_parser_for_model(
+            self.model_config.model
+        )
+        effective_auto_tools = enable_auto_tools or effective_tool_parser is not None
         self.parser = ParserManager.get_parser(
-            tool_parser_name=tool_parser,
+            tool_parser_name=effective_tool_parser,
             reasoning_parser_name=reasoning_parser,
-            enable_auto_tools=enable_auto_tools,
+            enable_auto_tools=effective_auto_tools,
             model_name=self.model_config.model,
         )
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
@@ -232,7 +243,7 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
 
-        self.enable_auto_tools = enable_auto_tools
+        self.enable_auto_tools = effective_auto_tools
         # HACK(woosuk): This is a hack. We should use a better store.
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove responses from the store.
