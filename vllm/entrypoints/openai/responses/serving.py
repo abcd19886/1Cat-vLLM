@@ -113,9 +113,9 @@ logger = init_logger(__name__)
 
 
 def _default_tool_parser_for_model(model_name: str | None) -> str | None:
-    """Return the native tool parser for Qwen3 Responses requests."""
+    """Return the native tool parser for Qwen3 Coder Responses requests."""
     if model_name and "qwen3" in model_name.lower():
-        return "hermes"
+        return "qwen3_coder"
     return None
 
 
