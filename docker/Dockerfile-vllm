@@ -875,7 +875,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # when a later pip install overwrites flashinfer package files.
 #RUN flashinfer show-config && flashinfer download-cubin
 ENV FLASHINFER_TARGET_ARCH=sm70
-RUN flashinfer show-config && FLASHINFER_TARGET_ARCH=sm70 flashinfer download-cubin
+# RUN flashinfer show-config && FLASHINFER_TARGET_ARCH=sm70 flashinfer download-cubin
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
 # consistently from the host (see https://github.com/vllm-project/vllm/issues/18859).
