@@ -197,7 +197,7 @@ def test_flashinfer_online_softmax_across_tiles_and_batches(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65])
+@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65, 127, 128, 129])
 def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -215,6 +215,52 @@ def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
     expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
     actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [129, 257])
+def test_flashinfer_query_groups_have_independent_softmax_state(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(2026)
+    q, k, v = [
+        torch.randn(2, length, 3, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    # Adjacent 16-query groups have different maxima and rescaling histories.
+    # The last query tile is partial; its inactive rows still join barriers.
+    q[:, 16::32] *= 4
+    k[:, 64:128] *= 4
+    k[:, 128:] *= 2
+    expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_flashinfer_graph_replay_uses_current_inputs():
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(123)
+    q, k, v = [
+        torch.randn(1, 193, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    op = flashinfer_extension()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op.forward(q, k, v, 128**-0.5)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = op.forward(q, k, v, 128**-0.5)
+    for multiplier in (1.0, 3.0):
+        q.mul_(multiplier)
+        k[:, 64:].neg_()
+        graph.replay()
+        expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
+        torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")

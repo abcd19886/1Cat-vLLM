@@ -83,7 +83,14 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
 
                     started = time.perf_counter()
                     result.update(
-                        export_video(video, audio, output_dir, fps=request.sampling.fps)
+                        export_video(
+                            video,
+                            audio,
+                            output_dir,
+                            fps=request.sampling.fps,
+                            encoder=config.video_encoder,
+                            gpu_index=rank,
+                        )
                     )
                     result["stage_seconds"]["packaging"] = time.perf_counter() - started
                     from vllm.model_executor.models.minimax_h3.time_request import (

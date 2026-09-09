@@ -29,17 +29,21 @@ class FP16WeightCache:
                 free, _ = torch.accelerator.get_memory_info(layer.weight.device)
                 required = layer.weight.numel() * 2
                 if (
-                    required >= free
-                    or torch.accelerator.memory_allocated() + required > 30 * 1024**3
+                    required * 2 >= free
+                    or torch.accelerator.memory_allocated(layer.weight.device)
+                    + required * 2
+                    > 30 * 1024**3
                 ):
                     raise RuntimeError(
                         "H3 FP16 weight cache exceeds available GPU memory"
                     )
                 # The weight stays in ConvRot coordinates; activations still
                 # receive the original rotation on every invocation.
-                layer.h3_fp16_weight = w8a16_extension().dequantize(
-                    layer.weight, layer.weight_scale
-                )
+                weight = w8a16_extension().dequantize(layer.weight, layer.weight_scale)
+                # Preserve logical [N,K], but store physical [K,N] for the
+                # measured cuBLASLt path. Budget both conversion temporaries.
+                layer.h3_fp16_weight = weight.t().contiguous().t()
+                del weight
         except BaseException:
             self.clear()
             raise

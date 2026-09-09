@@ -170,6 +170,36 @@ def evaluate_performance(runs):
     """Evaluate three unprofiled post-warmup runs; never use utilization as FLOPs."""
     if len(runs) != 3 or any(len(run["ranks"]) != 4 for run in runs):
         raise ValueError("acceptance requires three four-rank measurements")
+    baseline = runs[0]
+    for run in runs:
+        if sorted(rank["rank"] for rank in run["ranks"]) != list(range(4)):
+            raise ValueError("each measurement must contain four unique TP ranks")
+        if any(run[key] != baseline[key] for key in ("config", "request", "gpus")):
+            raise ValueError("acceptance measurements must use the same configuration")
+        sampling = run["request"]["sampling"]
+        expected = {
+            "width": 1344,
+            "height": 768,
+            "num_frames": 243,
+            "fps": 24,
+            "seed": 42,
+            "num_inference_steps": 50,
+        }
+        if any(sampling.get(key) != value for key, value in expected.items()):
+            raise ValueError("acceptance requires the fixed primary workload")
+        if run.get("measurement", {}).get("profiled") is not False:
+            raise ValueError("formal timing must be explicitly recorded as unprofiled")
+        if run.get("timing_valid") is False:
+            raise ValueError("run timing was excluded from performance evidence")
+        if any(rank["dit_calls"] != 49 for rank in run["ranks"]):
+            raise ValueError("the primary schedule requires 49 completed DiT calls")
+        if any(
+            type(rank["useful_denoise_flops"]) is not int
+            or rank["useful_denoise_flops"] <= 0
+            for rank in run["ranks"]
+        ):
+            raise ValueError("useful FLOPs must be positive integer counts")
+    ordered = [sorted(run["ranks"], key=lambda rank: rank["rank"]) for run in runs]
     seconds = [
         max(rank["stage_seconds"]["denoise"] for rank in run["ranks"]) for run in runs
     ]
@@ -178,14 +208,20 @@ def evaluate_performance(runs):
     medians = []
     for rank in range(4):
         values = [
-            run["ranks"][rank]["useful_denoise_flops"] / duration / 1e12
-            for run, duration in zip(runs, seconds)
+            ranks[rank]["useful_denoise_flops"] / duration / 1e12
+            for ranks, duration in zip(ordered, seconds)
         ]
         medians.append(statistics.median(values))
     cv = statistics.pstdev(seconds) / statistics.mean(seconds)
+    memory_passed = all(
+        rank["peak_allocated_bytes"] <= 30 * 1024**3
+        for run in runs
+        for rank in run["ranks"]
+    )
     return {
         "rank_median_tflops": medians,
         "denoise_seconds": seconds,
         "denoise_cv": cv,
+        "memory_passed": memory_passed,
         "performance_passed": all(value > 80 for value in medians) and cv <= 0.05,
     }

@@ -16,13 +16,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -42,9 +40,12 @@ from .modulation import (
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
 from .quantization import (
+    H3MergedColumnParallelLinear,
+    H3QKVParallelLinear,
     H3RowParallelLinear,
     Int8ConvRotLinearMethod,
     preserve_fp32_output,
+    rotate_local_fp16,
 )
 
 if TYPE_CHECKING:
@@ -375,7 +376,7 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = arch.attention_head_dim
         inner_dim = self.total_num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = H3QKVParallelLinear(
             hidden_size=arch.hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
@@ -547,6 +548,7 @@ class MiniMaxH3Attention(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        input_is_rotated: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -560,7 +562,10 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        if input_is_rotated:
+            qkv, _ = self.qkv_proj(x, input_is_rotated=True)
+        else:
+            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -610,7 +615,7 @@ class MiniMaxH3MLP(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        self.fc1 = MergedColumnParallelLinear(
+        self.fc1 = H3MergedColumnParallelLinear(
             arch.hidden_size,
             [arch.ffn_hidden_size, arch.ffn_hidden_size],
             bias=False,
@@ -633,8 +638,11 @@ class MiniMaxH3MLP(nn.Module):
         )
         preserve_fp32_output(self.fc2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
+    def forward(self, x: torch.Tensor, *, input_is_rotated=False) -> torch.Tensor:
+        if input_is_rotated:
+            hidden, _ = self.fc1(x, input_is_rotated=True)
+        else:
+            hidden, _ = self.fc1(x)
         if (
             hidden.is_cuda
             and hidden.dtype == torch.float16
@@ -799,6 +807,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        residual_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -815,6 +824,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
+        self.residual_group = get_tp_group() if residual_sequence_parallel else None
+        if self.residual_group is not None:
+            if self.residual_group.world_size != 4:
+                raise ValueError("H3 residual sequence parallelism requires TP4")
+            # These projections return unreduced FP32 partial sums. Reduce-scatter
+            # keeps that precision and assigns each rank its residual rows.
+            self.attn.out_proj.reduce_results = False
+            self.mlp.fc2.reduce_results = False
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch,
             arch.adaln_out_features,
@@ -845,6 +862,23 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        group = self.residual_group
+        if group is not None:
+            total = combined_indices.shape[0]
+            if (
+                num_requests != 1
+                or sp_seq_lens is not None
+                or total % group.world_size
+                or x.shape[0] != total // group.world_size
+                or x.dtype != _FP32_DTYPE
+            ):
+                raise ValueError(
+                    "H3 residual sequence parallelism needs local FP32 rows, "
+                    "TP-aligned global metadata and a single request without Ulysses"
+                )
+            combined_indices = combined_indices.narrow(
+                0, group.rank_in_group * x.shape[0], x.shape[0]
+            )
         (
             shift_msa,
             scale_msa,
@@ -864,6 +898,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             self.norm1.variance_epsilon,
             output_dtype=_COMPUTE_DTYPE,
         )
+        input_is_rotated = False
+        if group is not None:
+            # Rotation is row-independent. Compute it once on each row's owner,
+            # after the existing FP16 boundary, then gather its exact FP16 bits.
+            h, input_is_rotated = rotate_local_fp16(self.attn.qkv_proj, h)
+            h = group.all_gather(h, dim=0)
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -873,7 +913,10 @@ class MiniMaxH3DiTBlock(nn.Module):
             num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
+            input_is_rotated=input_is_rotated,
         )
+        if group is not None:
+            h = group.reduce_scatter(h, dim=0)
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -886,7 +929,13 @@ class MiniMaxH3DiTBlock(nn.Module):
             output_dtype=_COMPUTE_DTYPE,
         )
         residual = x
-        h = self.mlp(h)
+        input_is_rotated = False
+        if group is not None:
+            h, input_is_rotated = rotate_local_fp16(self.mlp.fc1, h)
+            h = group.all_gather(h, dim=0)
+        h = self.mlp(h, input_is_rotated=input_is_rotated)
+        if group is not None:
+            h = group.reduce_scatter(h, dim=0)
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
@@ -1013,6 +1062,8 @@ class MiniMaxH3DiTModel(nn.Module):
         config: Mapping[str, Any],
         quant_config: QuantizationConfig | None = None,
         arch_overrides: Mapping[str, Any] | None = None,
+        *,
+        residual_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         config_mapping = dict(config)
@@ -1036,6 +1087,15 @@ class MiniMaxH3DiTModel(nn.Module):
         self._qkv_checkpoint_is_runtime_layout = bool(
             getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False)
         )
+        self.residual_sequence_parallel = residual_sequence_parallel
+        if residual_sequence_parallel and (
+            get_tensor_model_parallel_world_size() != 4
+            or not self._qkv_checkpoint_is_runtime_layout
+        ):
+            raise ValueError(
+                "H3 residual sequence parallelism requires TP4 "
+                "and serialized INT8 ConvRot"
+            )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1100,6 +1160,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     arch,
                     quant_config,
                     prefix=f"blocks.{i}",
+                    residual_sequence_parallel=residual_sequence_parallel,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1520,6 +1581,23 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
+        residual_group = None
+        if self.residual_sequence_parallel:
+            residual_group = get_tp_group()
+            if (
+                local_len != seq_len
+                or hidden.shape[0] != seq_len
+                or block_combined.shape[0] != seq_len
+                or block_rope.shape[0] != seq_len
+                or seq_len % residual_group.world_size
+                or num_requests != 1
+            ):
+                raise ValueError(
+                    "H3 residual sequence parallelism requires a single request "
+                    "with TP-aligned global rows and no sequence-parallel hooks"
+                )
+            rows = seq_len // residual_group.world_size
+            hidden = hidden.narrow(0, residual_group.rank_in_group * rows, rows)
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1532,6 +1610,9 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
             )
+        if residual_group is not None:
+            # Final heads and the existing padding boundary consume full FP32 rows.
+            hidden = residual_group.all_gather(hidden, dim=0)
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(

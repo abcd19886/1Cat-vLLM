@@ -23,6 +23,42 @@ This remains one partition per engine. For reference generation, select
 `--partition ref2va` and the corresponding transformer. Keep a stable public API
 URL in the frontend's own reverse proxy when deploying it separately.
 
+### GPU video encoding
+
+Both `vllm video generate` and `vllm video serve` accept
+`--video-encoder h264_nvenc`. Select an FFmpeg executable built with NVENC:
+
+```bash
+IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg vllm video serve \
+  --model /path/to/MiniMax-H3 \
+  --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --tensor-parallel-size 4 --video-encoder h264_nvenc \
+  --host 127.0.0.1 --port 8000 --output-dir ./h3-jobs
+```
+
+The encoder runs on the rank-0 GPU inside the engine's leased group. RGBA
+packing runs on the input tensor's device; NVENC handles RGB-to-YUV420 conversion
+and H.264 compression. The current subprocess pipe still transfers raw frames
+through host memory. Audio encoding, MP4 muxing, and file I/O remain on the CPU.
+This does not distribute one video's encoding across the DiT tensor-parallel
+group. See [NVIDIA's FFmpeg guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html).
+
+The default remains `libx264` with CRF 18 / medium. NVENC uses VBR CQ 18 / p4 /
+HQ; equal numeric quality settings do not guarantee equal bitrate or quality.
+The selected FFmpeg must support `h264_nvenc`, packed RGBA, and `-rgb_mode`.
+Some imageio-ffmpeg bundled executables omit NVENC. A requested NVENC export
+fails with an `encode.log` diagnostic if unavailable; it never silently switches
+to CPU encoding.
+
+Rank-0 run metadata records `video_encoder`, `encoding_device`,
+`preparation_device`, `ffmpeg_executable`, and `export_stage_seconds`.
+The latter separates frame preparation/copy, WAV writing, FFmpeg startup/feed,
+and encoder/muxer completion. Feed time includes pipe backpressure and overlaps
+encoding, so these are sequential wall intervals rather than GPU kernel timings.
+The frontend video API and output audio/video contract are unchanged.
+See [the V100 export measurement](GPU_EXPORT.md) for measured latency, output
+quality, file-size tradeoffs, and the remaining host-memory transfer cost.
+
 ## Endpoints
 
 | Method | Path | Result |

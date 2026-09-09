@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Numerical reference operations for H3's FP16/FP32 execution contract."""
+"""Precision-sensitive H3 operations and their numerical references."""
 
 import torch
 from torch import nn
@@ -38,16 +38,24 @@ class RotaryEmbedding(nn.Module):
 
 def fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps):
     if (
-        q.is_cuda
-        and not torch.is_grad_enabled()
-        and q.dtype == k.dtype == rope_table.dtype == torch.float16
-        and q.ndim == k.ndim == 3
-        and q.shape[-1] == k.shape[-1] == 128
-        and q.shape[0] == k.shape[0]
-        and rope_table.shape == (q.shape[0], 96)
-        and q_weight.shape == k_weight.shape == (128,)
-        and all(t.device == q.device for t in (k, q_weight, k_weight, rope_table))
-        and all(t.stride(-1) == 1 for t in (q, k, q_weight, k_weight, rope_table))
+        not torch.is_grad_enabled()
+        and rope_table.ndim == 2
+        and rope_table.shape[-1] in (96, 128)
+        and rope_table.is_contiguous()
+        and all(
+            x.is_cuda
+            and x.dtype == torch.float16
+            and x.ndim == 3
+            and x.shape[0] == rope_table.shape[0]
+            and x.shape[0] > 0
+            and x.shape[1] > 0
+            and x.shape[-1] == 128
+            and x.stride(-1) == 1
+            and w.shape == (128,)
+            and w.is_contiguous()
+            and x.device == w.device == rope_table.device
+            for x, w in ((q, q_weight), (k, k_weight))
+        )
     ):
         from .qk_norm_rope import qk_norm_rope
 

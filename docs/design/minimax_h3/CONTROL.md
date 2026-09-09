@@ -1,18 +1,315 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer change:
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md).
+Rotate FP16 rows on their owner before all-gather, avoiding duplicated QKV/MLP
+ConvRot while retaining exact matrix operations and TP sums. The unchanged
+39-frame/20-update run takes 61.538397 seconds, 56.286054 useful TFLOPS/card;
+final video/audio latents and fresh MP4 remain bitwise equal. The 123-test
+suite and both independently launched TP4 regressions pass. Current tracing
+attributes 41.10% to GEMM, 39.81% to attention, 13.52% to communication and
+1.02% to ConvRot. Gather/projection overlap, Q64 aliased K/V and updated Q32/N64
+reuse controls do not improve the selected path and are rejected. The combined
+distributed test launcher hang is retained; use separate torchrun lifetimes.
+Human quality, <50 seconds and >80 TFLOPS remain open.
+
+Latest FlashInfer change: [FLASHINFER_V4.md](FLASHINFER_V4.md).
+Four-row exact V transposition permits 64-bit shared stores, reducing the
+unchanged 39-frame/20-update denoise to 62.434779 seconds and 55.477950 useful
+TFLOPS/card. Final video/audio latents and fresh MP4 remain bitwise equal.
+The 122-test suite and three 12-case sanitizers pass. Human quality review,
+<50 seconds and >80 TFLOPS remain open; residual sharding still defaults off.
+The communication-overlap prototype is rejected after FP32 reduction error
+amplifies during sampling. Future optimization prioritizes bitwise equality;
+see [FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md) for the fresh baseline trace
+and failed paths.
+
+Latest FlashInfer integration: [FLASHINFER_SILU.md](FLASHINFER_SILU.md).
+Dependency `9764b6c202`'s shared FP32 SiLU/FP16 preparation fusion works with
+our FP32 residual reduce-scatter. The unchanged 39-frame/20-update run takes
+63.565580 seconds (54.491025 useful TFLOPS/card), with bitwise-equal video/audio
+latents and fresh MP4. The 122-test suite and corrected four-rank block test
+pass. Attention/W8 binaries remain unchanged. Human quality, <50 seconds and
+>80 TFLOPS are still not accepted.
+
+Latest FlashInfer warp transpose: [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md).
+Warp-local exact FP16 pair exchange removes a shared staging round trip and
+one CTA barrier. The unchanged residual-sharded 39-frame/20-update run takes
+64.920336 seconds (53.353907 useful TFLOPS/card), down from 65.804661 seconds.
+Video/audio latents and fresh MP4 remain bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU shows 37.57% Tensor pipe activity;
+direct V stores introduce bank conflicts, so MIO remains a bottleneck.
+Human quality review, <50 seconds and >80 TFLOPS remain open.
+
+Latest FlashInfer operator change:
+[FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md). A 68-half probability stride
+and 64-bit fragment loads remove almost all repeating shared-memory bank
+conflicts. Full unchanged 39-frame/20-update denoise with residual sharding
+falls from 66.863312 to 65.804661 seconds (52.636903 useful TFLOPS/rank).
+Video/audio latents and the fresh MP4 are bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU verifies excessive wavefronts fall
+from 235,879,168 to 1,042,944; Tensor pipe activity reaches 36.33%.
+The first same-name native A/B import collided and is marked invalid; qualified
+module names and identity assertions fix the harness, and corrected short/long
+controls establish the gain. Human quality review, <50 seconds and >80 TFLOPS
+remain open. Residual sharding still defaults off.
+
+Latest opt-in FlashInfer improvement:
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). TP4 FP32 residual sharding
+reduces the unchanged 39-frame/20-update denoise to 66.863312 seconds,
+51.803500 useful TFLOPS/rank. The native implementation matches the prototype
+bitwise; it differs from the replicated baseline (video SSIM 0.986179).
+Automatic media checks and the four-rank block/padding/FP32-range regression
+pass. Human quality acceptance remains pending, so the new option defaults
+off. The below-50-second and >80-TFLOPS/card targets remain incomplete.
+Fresh counters from the retained attention binary show 34.91% Tensor pipe
+activity and 50.09% scheduler cycles without an eligible warp. Three query
+reuse variants regress; the Q128/K128 alias variant spills and is not run.
+Q96/K128 removes spills but remains slower. Replicated INT8 MLP weights with
+local token rows also regress (two updates 6.645113 -> 7.030977 seconds), despite
+removing two MLP collectives; this artifact-only path is rejected without a
+full-video run. Its per-rank valid-row accounting and failed harness attempt
+are recorded in the same document.
+
+Latest retained FlashInfer change: [FLASHINFER_TO50.md](FLASHINFER_TO50.md).
+Q shared-memory swizzling and an exact transposed FP16/cuBLASLt weight cache
+reduce the unchanged 39-frame/20-update denoise to 70.828264 seconds,
+48.903550 useful TFLOPS per rank. Video/audio latents and fresh MP4 remain
+bitwise equal. 105 tests pass after dependency reconciliation; previous
+FlashInfer sanitizer checks and seven added memory checks pass. The below-50s
+milestone, human quality review and per-card >80-TFLOPS acceptance remain open.
+
+Latest FlashInfer investigation: [FLASHINFER_ROOT_CAUSE.md](FLASHINFER_ROOT_CAUSE.md).
+Fused QK preparation and an 8x8 V transpose reduce the same 39-frame/20-update
+denoise to 75.140751 seconds, or 46.096872 useful TFLOPS per rank. Video/audio
+latents and freshly decoded MP4 are unchanged from the preceding K64 run.
+79 tests pass. The next short-run milestone is below 50 seconds with unchanged
+parameters and no quality regression; >80 TFLOPS per rank remains incomplete.
+
+FlashInfer feeding follow-up on its own branch: see
+[FLASHINFER_FEEDING.md](FLASHINFER_FEEDING.md). Q128/K64 reduces complete
+39-frame/20-update denoise to 78.968862 s, or 43.862270 useful TFLOPS per rank.
+65 tests and focused sanitizers pass; fresh decoding passes automatic checks.
+Output rounding changes, human quality review and the >80-TFLOPS gate remain
+open. The parallel FlashAttention task is outside this branch's scope.
+
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
 Workflow and adapter expansion is tracked in [WORKFLOWS.md](WORKFLOWS.md) and
 [ADAPTATION.md](ADAPTATION.md), with validation entries at the end of this file.
 
-Current decision: the user selects FlashAttention-V100 as the H3 development
-mainline, superseding the earlier FlashInfer choice. Optimize complete denoise
-toward >80 useful TFLOPS on every participating GPU; keep FlashInfer as the
-measured control/rollback. Development uses 39-frame clips and 20 actual
-updates for quality. Preserve D128 MHA and its original scale when reusing
-the existing D256 TensorOp architecture; padding never increases useful FLOPs.
+Current decision: development proceeds on separate FlashAttention and
+FlashInfer branches. FlashAttention remains the default H3 backend;
+independent FlashInfer optimization and reproduction explicitly select
+`FLASHINFER_SM70`. Both paths target >80 useful TFLOPS/card and below 50
+seconds for the unchanged 39-frame, 20-update development workload. Preserve
+D128 MHA, its original scale and valid-token FLOP accounting, including when
+reusing the existing D256 TensorOp architecture; padding never increases
+useful FLOPs. Residual sharding remains opt-in, and integrating development
+code does not establish the pending quality or performance acceptance.
+
+## 2026-09-09 FlashInfer integration with main
+
+PR #564 synchronizes with `onecat/main@da65a6b23e9c`, which already contains
+native H3 (#557), SM70 operators (#558), workflows/adapters (#565), shared
+residual/local-rotation support (#568) and validation tools (#559). Both
+backend histories and the workflow records are retained. Configuration keeps
+main's dual-backend residual support and adapter rejection. The local-rotation
+regression checks both backends within one distributed fixture lifetime.
+Shared model dataflow and native FlashInfer/W8 CUDA sources and binaries are
+unchanged from the measured local-rotation build.
+
+The integrated video suite passes **266 tests, 2 skipped, 1 deselected**, using
+the preceding FlashInfer suite command against `e7fa44deb253`. After including
+PRs #568/#559, **24 targeted tests pass** for the changed configuration, metrics
+and regressions. The final INT8 local-rotation and default unquantized TP4
+block modules each pass on every rank, covering both attention backends in
+separate torchrun processes. Raw commands and logs are retained in the
+campaign's `feeding-gather/merge-main/` and its `final/` subdirectory.
+The 61.538397-second result remains the preceding
+development measurement; this integration does not add a performance claim
+or complete the pending human quality, 50-second or 80-TFLOPS gates.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
+
+### Local ConvRot before gather: 58.19 seconds
+
+The optional residual-sharded route now rotates normalized FP16 rows on their
+owning rank before all-gather. QKV and gate/up projections consume those exact
+gathered bits without repeating ConvRot. Each rank rotates one quarter of the
+rows; the original ConvRot256 arithmetic, INT8 scales, projection shapes and
+FLOP hooks are preserved. CPU/unquantized paths retain ordinary forwards.
+This reuses a read-only working-tree snapshot from the independent FI task,
+based on `53780abef0e9ef190aa55a1f61d8fd5fbd390aa1`, with the regression adapted
+to native FlashAttention. Snapshot patch SHA256:
+`ce41592338adeef0388c7b5b826351d378c468bfa58e7df3def662cf7056dc4b`.
+The source was uncommitted in that tree at capture; no FI attention delegation
+or H3 CUDA binary change is involved.
+
+The unchanged 1344x768, 39-frame/24-FPS, seed42, INT8 ConvRot FL2VA, TP4 GPU0-3
+workload completes **20 actual updates in 58.190385 s**, or **2.909519 s/update
+and 59.524500 useful model TFLOPS/card**. This reduces the previous optional
+58.794562 s result by 0.604177 s (1.03%). Per-card useful FLOPs remain
+3,463,753,579,661,312. Peak denoise Torch allocation is unchanged at
+**6.195001125 GiB/card**; NVML peak device-used memory is 8.046386719 GiB/card.
+Persistent FP16 cache and Lt workspace remain zero. This is one unprofiled,
+cached-text development run after a one-call warmup, not formal acceptance.
+Three paired two-update checks give medians 5.878070 ->5.813375 s (1.10%).
+
+Both complete video/audio latent tensors are **bitwise equal** to the previous
+58.79-second run, finite and identical across ranks. Its decoded media is
+reused only after these checks and verification of the MP4 hash below. There
+is no new VAE or end-to-end timing. Automatic validity is preserved; the prior
+human audiovisual review remains pending. The option still defaults to false;
+the flag-off baseline remains 62.804019 s. Omit the flag to restore that path,
+or use parent `2a560b0a7fa0` to revert only the local-rotation change.
+
+Validation: 62 targeted tests pass, one GPU case is deselected. A separate
+torchrun invocation runs one actual four-rank test, passing on every rank:
+cached/uncached INT8 projections, two valid/padded lengths, consecutive blocks,
+rank-specific weights, residuals above 65504, exact output and unchanged FLOP
+hooks. Pre-commit passes. Do not combine distributed GPU test modules in one
+pytest lifetime: the repository fixture tears down distributed state between
+tests. Earlier sanitizer runs cover unchanged operators, not a new run here.
+
+Eight further attention variants remain artifact-only. All match the native
+output exactly across 12 tested lengths and pass sampled FP32 references;
+none establishes a stable paired speedup including wrapper/copy costs:
+
+| Candidate | Native control ms | Candidate ms | Decision |
+| --- | ---: | ---: | --- |
+| Register row max/sum | 20.210688 | 20.071424 | No stable paired gain |
+| Separate max/sum exchange | 20.093952 | 20.232191 | No gain |
+| Head-contiguous Q/K/V packing | 19.866625 | 20.254721 | Packing loses |
+| Direct Q/K vector iterators | 20.256767 | 21.655552 | Hot register spills |
+| Direct Q iterator | 20.048897 | 20.049919 | No gain |
+| Direct K iterator | 19.971071 | 20.135937 | No gain |
+| Direct V iterator | 20.254721 | 19.984385 | Clock drift; unstable gain |
+| PV-only 64x32 warp | 20.199425 | 23.879681 | Slower after mapping fix |
+
+Query-window attention/projection overlap also loses, including a version
+retaining the full-shape attention specialization and validated cloned GEMM
+plans. A three-window TP4 block pipeline takes about 6.04 s versus 5.87 s for
+two updates and introduces nonzero latent deltas; it is not integrated. Its
+raw hook counter includes 29 padding rows and is explicitly invalid for
+acceptance accounting. See `flashattention-register50/failed-paths.json` for
+exact jobs, sources and outcomes; do not repeat unchanged candidates.
+
+Latest evidence: `flashattention-register50/REPORT.md`, `report.json`, source
+snapshot hashes, paired probes, test logs and NVML curves. Media:
+`outputs/quality39-int8-flashattn-localrot-20steps/FLASH_ATTN_V100/`.
+**Under 50 seconds, attention 60 TFLOPS, formal per-card 80 TFLOPS and human
+quality acceptance remain incomplete.** GEMM/attention operand reuse remains
+the main optimization target; this small ConvRot gain does not resolve it.
+
+### Optional FP32 residual row sharding: 58.79 seconds
+
+`--residual-sequence-parallel` enables an experimental TP4 FL2VA INT8 path
+for either native SM70 attention backend. It defaults to false in both
+`video generate` and `video serve`. This reuses the committed residual dataflow
+from the independent FlashInfer branch at `5b4f0bba31`, adapting its backend
+gate and tests for FlashAttention-V100. No FlashInfer attention code is ported
+or delegated to when FlashAttention is selected.
+
+Each rank retains only its FP32 residual rows through the DiT blocks. The
+existing normalization boundary produces FP16 rows, which are gathered before
+QKV and MLP projection. Output projections retain FP32 partial sums and use
+FP32 reduce-scatter. Final heads receive the gathered FP32 rows. This reduces
+repeated normalization/gating work and intermediate data movement, preserving
+INT8/scale information, all GEMMs, valid attention tokens and denoise updates.
+The feature rejects unsupported TP sizes, BF16 checkpoints, Ref2VA, adapters, multiple
+requests and simultaneous Ulysses hooks. The original path remains available
+by omitting the flag; source rollback is kernel parent `9764b6c20259`.
+
+On the unchanged 1344x768, 39-frame/24-FPS, seed42, INT8 ConvRot FL2VA,
+TP4 GPU0-3 request, **20 actual updates take 58.794562 s**:
+**2.939728 s/update and 58.912822 useful model TFLOPS/card**. This is a 6.38%
+time reduction from the 62.804019 s default. Per-card useful FLOPs remain
+3,463,753,579,661,312. Peak denoise Torch allocation falls from 6.566735744 to
+**6.195001125 GiB/card**; NVML peak device-used memory is 8.171386719 GiB/card.
+Persistent FP16 weight cache and cuBLASLt workspace stay zero. This is one
+unprofiled development run with a one-call warmup and prompt-verified cached
+text, not an end-to-end or formal repeated measurement.
+
+Fresh VAE decoding takes 8.478661 s, with 34.904292 s VAE loading reported
+separately. All automatic media checks pass. FP32 reduction order changes:
+video/audio latent relative RMS differences from the 62.80-second baseline
+are 3.87465% /1.20270%. Decoded-video SSIM is 0.983989 and PSNR 38.238221 dB;
+these are auxiliary comparisons, not quality thresholds. Eight sampled frames
+show a consistent red boat, yellow duck and background. Human audiovisual
+scoring remains pending, so the option is not promoted to the default.
+MP4 SHA256 is
+`f00ba75587f58e2a63a105647cb634eebd60b154ab7b3551f385ca2df96e5243`.
+
+Separate two-update Nsight Systems traces explain the gain. Rank0 exclusive
+wall seconds close to each trace's own denoise NVTX span:
+
+| Category | Replicated residual | Sharded residual |
+| --- | ---: | ---: |
+| GEMM | 2.539663 | 2.550870 |
+| Attention | 2.005245 | 2.023926 |
+| TP collectives | 1.076831 | 0.845654 |
+| Other GPU kernels | 0.440786 | 0.237076 |
+| ConvRot | 0.125264 | 0.126346 |
+| Weight dequantization | 0.059483 | 0.059765 |
+| Copies | 0.012490 | 0.012507 |
+| FP16 preparation outside fused kernels | 0.000026 | 0.000025 |
+| No recorded GPU activity | 0.031895 | 0.035798 |
+| Complete trace span | 6.291683 | 5.891967 |
+
+The fused activation's preparation is included in other GPU kernels. GEMM
+and attention still consume about 78% of the new trace. This is not an idle
+optimization. Explicit copies are small; the profile does not establish an
+HBM-copy bottleneck. At 60 useful attention TFLOPS alone, the old trace still
+projects roughly 61 seconds for 20 updates with all other costs held fixed;
+this is an Amdahl illustration, not a measurement or hardware lower bound.
+
+NCU on the unchanged native wide attention reports 246 registers/thread,
+34,304 shared bytes/block, 12.47% achieved occupancy, 49.23% tensor-pipe
+activity, 66.46% L1/shared data-path throughput and 4.57% HBM throughput.
+SASS samples point to QK shared stores waiting for operands, shared-load/HMMA
+dependencies and PV address instructions. Higher occupancy alone is not a
+sufficient fix. Eight isolated paired candidates pass sampled FP32 references
+but fail to establish a speedup; all remain outside the installed extension:
+
+| Candidate | Native control ms | Candidate ms | Decision |
+| --- | ---: | ---: | --- |
+| Pretranspose V to column layout | 20.215809 | 21.629951 | Packing/zeroing loses |
+| Warp/shared row maximum | 20.073471 | 20.227072 | No gain |
+| Q32/K256 | 20.044800 | 24.824833 | Reuse/traffic regression |
+| Unroll fixed QK loop | 20.204544 | 20.252672 | No gain |
+| Unroll fixed PV loop | 19.892223 | 20.021248 | No gain |
+| Eight warps | 20.045824 | 26.279936 | Register spills |
+| Global-load cache policy cg | 20.264959 | 20.225023 | 0.2% noise |
+| Q32/K128, four warps, three CTAs | 20.711424 | 26.468351 | Reuse regression |
+
+A further artifact-only GEMM/reduce-scatter overlap probe uses zero persistent
+cache and workspace, unlike the earlier independent 10-GiB-cache probe. Three
+paired two-update runs give medians 5.872043 ->5.742729 s (2.20%). It preserves
+useful FLOPs and reduces temporary memory, but has nonzero latent differences
+and no complete-video quality validation. Extra packing, streams and GEMM-plan
+APIs are not integrated for this modest prefix gain. Do not report 57.43 s as
+measured full-20 denoise, or repeat these variants without a new hypothesis.
+
+Validation: 70 targeted numerics/service/configuration tests pass. One actual
+four-rank collective test passes on every rank, covering both native attention
+backends, three valid/padded lengths, consecutive blocks, rank-dependent
+weights, FP32 residual values above 65504 and poisoned padding. Pre-commit
+checks pass. No CUDA source or installed binary changes in this follow-up;
+prior attention sanitizer coverage is retained, not presented as a new run.
+The actual full-20 run records all ranks' finite, mutually identical final
+latents and unchanged FLOP counts.
+
+Evidence root: `flashattention-pipeline50/` (exact jobs, NCU/SASS, both Nsight
+traces, candidate source/binaries, negative results, tests, reports and NVML
+curves). Fresh output:
+`outputs/quality39-int8-flashattn-residual-20steps/FLASH_ATTN_V100/`.
+Installed attention SHA256 remains
+`bdb3dcf0eea8c23f992536182a06d26f7b61c7bb6ddefa4b3c88590b81ad0005`.
+
+**Under 50 seconds, attention 60 TFLOPS, formal per-card 80 TFLOPS and human
+quality acceptance remain incomplete.** Keep the arithmetic operand-reuse
+focus; do not mistake 100% NVML utilization for Tensor Core saturation.
 
 ### Wide QK reuse and fused MLP preparation: 62.80 seconds
 

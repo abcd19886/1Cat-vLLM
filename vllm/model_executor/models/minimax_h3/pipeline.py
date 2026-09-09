@@ -490,7 +490,10 @@ class MiniMaxH3Pipeline(nn.Module):
         token = attention_backend.set(config.attention_backend)
         try:
             self.transformer = MiniMaxH3DiTModel(
-                architecture, quant_config=quant, arch_overrides=overrides
+                architecture,
+                quant_config=quant,
+                arch_overrides=overrides,
+                residual_sequence_parallel=config.residual_sequence_parallel,
             )
         finally:
             attention_backend.reset(token)
