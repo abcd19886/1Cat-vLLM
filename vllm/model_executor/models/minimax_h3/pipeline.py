@@ -12,6 +12,7 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,8 +23,10 @@ from torch import nn
 from tqdm.auto import tqdm
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 
+from vllm import envs
 from vllm.distributed import get_tp_group, get_world_group
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import get_cpu_memory
 from vllm.video.metrics import DenoiseWorkCounter
 
 from .attention import attention_backend
@@ -81,7 +84,7 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
-from .residency import PinnedModuleStager
+from .residency import MMapHostWeights, PinnedModuleStager
 from .sigma_schedule import DMD2SigmaSchedule
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
@@ -427,7 +430,36 @@ class MiniMaxH3Pipeline(nn.Module):
         super().__init__()
         self.config = config
         self.partition = config.partition
+        from vllm.media.progress import report_loading
+
+        def loading(done, component):
+            group = get_tp_group()
+            report_loading(
+                done,
+                4,
+                component,
+                rank=group.rank_in_group,
+                world_size=group.world_size,
+            )
+
+        loading(0, "transformer")
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
+        use_mmap = config.host_memory_mode == "mmap" or (
+            config.host_memory_mode == "auto" and get_cpu_memory() < 128 * 1024**3
+        )
+        self._host_backing = (
+            MMapHostWeights(
+                config.host_memory_directory or Path(envs.VLLM_CACHE_ROOT) / "h3-host"
+            )
+            if use_mmap
+            else None
+        )
+        if self._host_backing is not None:
+            logger.info(
+                "H3 uses reclaimable disk-backed host weights at %s; "
+                "weights and compute precision are unchanged",
+                self._host_backing.directory,
+            )
         from .fasth3 import FastH3Fusion, FastH3Spec
         from .flashgen import FlashGenSpec, restore_dense_adaln_weights
         from .lora import inspect_deployment_adapter, select_adapter_file
@@ -490,10 +522,17 @@ class MiniMaxH3Pipeline(nn.Module):
         token = attention_backend.set(config.attention_backend)
         try:
             self.transformer = MiniMaxH3DiTModel(
-                architecture, quant_config=quant, arch_overrides=overrides
+                architecture,
+                quant_config=quant,
+                arch_overrides=overrides,
+                residual_sequence_parallel=config.residual_sequence_parallel,
             )
         finally:
             attention_backend.reset(token)
+        if self._host_backing is not None:
+            PinnedModuleStager.map_cpu_weights(
+                self.transformer, self._host_backing, preserve_parameters=False
+            )
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
@@ -518,6 +557,8 @@ class MiniMaxH3Pipeline(nn.Module):
             method = getattr(layer, "quant_method", None)
             if method is not None:
                 method.process_weights_after_loading(layer)
+                if self._host_backing is not None:
+                    PinnedModuleStager.map_cpu_weights(layer, self._host_backing)
         self.transformer.post_load_weights()
         self.turbo_spec = None
         if fusion is not None:
@@ -528,13 +569,16 @@ class MiniMaxH3Pipeline(nn.Module):
             self.turbo_spec = install_adapter(
                 self.transformer, config.lora_path, self.partition
             )
-        self._dit_stager = PinnedModuleStager(self.transformer, self.device)
+        self._dit_stager = PinnedModuleStager(
+            self.transformer, self.device, host_backing=self._host_backing
+        )
         self._weight_cache = FP16WeightCache(
             self.transformer,
             budget_gib=config.fp16_weight_cache_gib,
             layers=config.fp16_cache_layers,
         )
         self.text_encoder_group = get_tp_group()
+        loading(1, "text_encoder")
         self.text_encoder_tp_size = self.text_encoder_group.world_size
         self._dit_rank = self.text_encoder_group.rank_in_group
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -549,14 +593,22 @@ class MiniMaxH3Pipeline(nn.Module):
             load_model=True,
             encoder_group=self.text_encoder_group,
         )
+        if self._host_backing is not None:
+            PinnedModuleStager.map_cpu_weights(
+                self.text_encoder, self._host_backing, preserve_parameters=False
+            )
         self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
-        self._encoder_stager = PinnedModuleStager(self.text_encoder, self.device)
+        self._encoder_stager = PinnedModuleStager(
+            self.text_encoder, self.device, host_backing=self._host_backing
+        )
+        loading(2, "video_vae")
         self.video_vae = MiniMaxH3VideoVAE(
             str(shared / "video_vae"),
             device=self.device,
             load_device=torch.device("cpu"),
         )
         self.video_vae.set_parallel_size(config.tensor_parallel_size)
+        loading(3, "audio_vae")
         self.audio_vae = MiniMaxH3AudioVAE(
             str(shared / "audio_vae"),
             device=self.device,
@@ -565,6 +617,7 @@ class MiniMaxH3Pipeline(nn.Module):
         self.stage_durations = {}
         self.actual_dit_calls = 0
         self.eval()
+        loading(4, "ready")
 
     def _transformer_for_task(self, task):
         return self.transformer
@@ -622,8 +675,11 @@ class MiniMaxH3Pipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, request: H3Request):
+        from vllm.media.progress import report
+
         self.stage_durations = {}
         self.actual_dit_calls = 0
+        report("encoding")
         started = time.perf_counter()
         context = self._prepare_request_inputs(
             prompt=request.prompt,
@@ -645,6 +701,7 @@ class MiniMaxH3Pipeline(nn.Module):
             time.perf_counter() - started
         )
         started = time.perf_counter()
+        report("decoding")
         video, audio = self.decode(
             video_latent, audio_latent, height=context["height"], width=context["width"]
         )
@@ -1518,12 +1575,22 @@ class MiniMaxH3Pipeline(nn.Module):
             video_outputs=int(branch.update_mask.sum()),
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
+        from vllm.media.progress import report
+
+        report("staging_model")
         with self._resident_dit_layers_on_device(enabled=True):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()
             started = time.perf_counter()
-            with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
+            total = len(inputs["sigmas_video"]) - 1
+            report("denoising", completed=0, total=total)
+            with self.progress_bar(total=total) as progress:
+
+                def on_step(step, video, audio):
+                    progress.update()
+                    report("denoising", completed=step + 1, total=total)
+
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=transformer,
                     positive=branch,
@@ -1540,7 +1607,7 @@ class MiniMaxH3Pipeline(nn.Module):
                     audio_cond_noise_aug_for_inference=(
                         MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
                     ),
-                    on_step=lambda step, video, audio: progress.update(),
+                    on_step=on_step,
                 )
             torch.accelerator.synchronize()
             dist.barrier()

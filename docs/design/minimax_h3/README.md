@@ -1,5 +1,13 @@
 # Native MiniMax H3 (development)
 
+The latest optional residual-sharded FlashInfer development run completes
+39 frames and 20 denoise updates in 61.538397 seconds, with unchanged
+video/audio latents and fresh MP4. See
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md) for local ConvRot,
+the current bottleneck trace, validation and remaining gates.
+The numerical-drift overlap experiment is rejected; see
+[FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md).
+
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation
@@ -18,6 +26,31 @@ when working on top of an existing compatible 1Cat installation. It requires
 CUTLASS v4.4.2 source. It does not rebuild the rest of vLLM. The normal CMake
 build fetches that pinned CUTLASS version automatically.
 The development tests use Transformers 5.15.1 and Diffusers 0.40.0.
+
+## Host memory and temporary disk storage
+
+Four 32-GB GPUs do not imply that the host can retain the complete CPU model.
+Pinned DiT and text-encoder masters exhausted a 64-GiB host during TP4 loading.
+`--host-memory-mode auto` therefore uses reclaimable, disk-backed CPU weights
+on hosts with less than 128 GiB of physical RAM. Larger hosts retain the pinned
+path. `--host-memory-mode mmap` or `pinned` selects a policy explicitly.
+
+The disk-backed path preserves tensor bytes, aliases, strides and dtypes;
+quantization, attention and denoise schedules are unchanged. Parameters are
+mapped before streaming checkpoint writes, avoiding a complete anonymous CPU
+copy before offload. Storage transformed during quantization and adapter
+preparation is mapped again before staging. Device transfers from these CPU
+masters may take longer than transfers from pinned RAM.
+
+Temporary storage defaults to `VLLM_CACHE_ROOT/h3-host`. Use
+`--host-memory-directory /path/on/local-ssd` to select another directory.
+Each allocation reserves disk space before mapping so a full disk reports a
+loading error instead of a later SIGBUS. Files are immediately unlinked after
+mapping; their space remains occupied until the worker releases the tensors,
+including after an abrupt worker exit. Original model files remain read-only.
+Provide enough free SSD space for the selected model's CPU weights. This mode
+reduces weight residency; it does not eliminate activation or media-processing
+memory requirements.
 
 ```bash
 export CUDA_HOME=/path/to/cuda-12.8
@@ -86,6 +119,22 @@ budget with `--fp16-weight-cache-gib` and repeat `--fp16-cache-layer` for the
 fixed layer list. Cached weights retain ConvRot coordinates. Cache/staging
 preparation is separately timed; dequantization remains inside denoise timing
 for uncached weights. Both original INT8 tensors and FP32 scales are retained.
+The measured 39-frame/20-update cache list and native cuBLASLt configuration
+are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
+commands, output comparison and the still-incomplete 50-second target.
+
+For the experimental FlashInfer TP4 INT8 FL2VA route, add
+`--residual-sequence-parallel` to shard FP32 residual rows and reduce TP
+communication. It defaults off and changes floating-point reduction order.
+The unchanged 39-frame/20-update denoise measures 66.863312 seconds; automatic
+checks pass, while five-axis human quality review and the 50-second target
+remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
+differences, GPU tests, current hardware counters and rollback.
+
+The subsequent probability-tile layout change reduces this same optional
+route to 65.804661 seconds and preserves its video/audio outputs bitwise.
+See [FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md) for the instruction-level
+bottleneck, corrected A/B measurements and new sanitizer/profiler evidence.
 
 `--int8-weight-layout column` is the default for DiT INT8 projections. Loading
 reorders physical INT8 storage without changing logical weights or scales.
@@ -102,6 +151,22 @@ large FP32 activation intermediate without lowering arithmetic precision or
 adding a persistent cache. CPU, unquantized and FP32-input paths keep their
 existing implementation.
 
+For the measured TP4 FL2VA INT8 development workload, optionally add
+`--residual-sequence-parallel` to `video generate` or `video serve`. This keeps
+FP32 residual rows sharded across ranks and gathers normalized FP16 inputs at
+the existing precision boundary. Both native SM70 attention backends support
+this option; it rejects BF16, Ref2VA, adapters and non-TP4 configurations. It defaults to
+false. Normalized FP16 rows are now rotated locally before all-gather, avoiding
+four copies of the same ConvRot work while preserving gathered bits and GEMMs.
+The native FlashAttention 39-frame/20-update run measures 58.190385 s
+and 6.195001125 GiB peak denoise allocation/card, versus 62.804019 s and
+6.566735744 GiB without the flag, with zero persistent cache in both cases.
+Its complete audio/video latents equal the earlier 58.794562-second sharded
+run bitwise, so that run's checked decode is reused. Automatic checks pass;
+the sharded route changes FP32 reduction order from the default and its human
+quality review remains pending. Omit the flag to restore the default.
+These are short development measurements, not the 243-frame acceptance run.
+
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not
 replace the five-axis human quality review. Useful TFLOPS use actual local
@@ -109,8 +174,17 @@ matrix dimensions and valid attention tokens, exclude padding/rotation/dequant,
 and divide by the maximum complete denoise duration across all four ranks.
 NVML utilization and standalone operator speed are diagnostic evidence only.
 
-The native engine reserves a whole available GPU group (0–3 first, then 4–7)
-with the shared 1Cat V100 per-card and group locks. The lease remains held until
+The native engine reserves a whole available GPU group with the shared 1Cat
+V100 per-card and group locks. An explicit `CUDA_VISIBLE_DEVICES` selection
+(NVML indices or GPU UUIDs) bounds the candidate groups; a busy selected group
+never falls back to unselected devices. UUIDs are recommended for launchers.
+Without a selection, devices with at least 30 GiB capacity form ordered groups,
+so a small display card does not shift the four-V100 grouping. Workers receive
+the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences.
+The NVML platform resolves these UUIDs for physical-device queries before
+pipeline imports, so capability checks use the same selected boards. Custom
+all-reduce topology checks use this mapping as well.
+The lease remains held until
 its workers exit. A group reserved by another cooperating task is unavailable
 even while that task is between CUDA processes. If both groups are occupied or
 reserved, startup fails before model loading.

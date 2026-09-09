@@ -21,8 +21,11 @@ from torch.nn import Module
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     LinearBase,
     LinearMethodBase,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
@@ -393,13 +396,13 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             output = torch.nn.functional.linear(x, weight, bias)
         return output.reshape(*original_shape[:-1], layer.weight.shape[0])
 
-    def apply_prepared(self, layer, values, scale):
+    def apply_prepared(self, layer, values, scale, *, input_is_rotated=False):
         """Project FP16 rows with an explicit scale restored before TP reduction."""
         from .cuda_ops import fp16_gemm, w8a16_extension
 
         ops = w8a16_extension()
         x = values.reshape(-1, values.shape[-1])
-        if self.layer_config.convrot:
+        if self.layer_config.convrot and not input_is_rotated:
             if self.layer_config.convrot_groupsize != 256:
                 raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
             x = ops.rotate(x)
@@ -412,6 +415,55 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         if scale is not None:
             output = output * scale
         return output.reshape(*values.shape[:-1], layer.weight.shape[0])
+
+
+def rotate_local_fp16(layer, values):
+    """Rotate local residual rows before their bit-preserving TP all-gather."""
+    method = layer.quant_method
+    if (
+        values.is_cuda
+        and values.dtype == torch.float16
+        and isinstance(method, Int8ConvRotLinearMethod)
+        and method.layer_config.convrot
+        and method.layer_config.convrot_groupsize == 256
+        and layer.bias is None
+        and not layer.gather_output
+    ):
+        from .cuda_ops import w8a16_extension
+
+        return w8a16_extension().rotate(values), True
+    return values, False
+
+
+class _H3RotatedColumnInput(ColumnParallelLinear):
+    def forward(self, input_, *, input_is_rotated=False):
+        if not input_is_rotated:
+            return super().forward(input_)
+        method = self.quant_method
+        if (
+            not input_.is_cuda
+            or input_.dtype != torch.float16
+            or self.bias is not None
+            or self.gather_output
+            or not isinstance(method, Int8ConvRotLinearMethod)
+            or not method.layer_config.convrot
+            or method.layer_config.convrot_groupsize != 256
+        ):
+            raise ValueError(
+                "Pre-rotated H3 columns require bias-free INT8 FP16 inputs"
+            )
+        # The module still receives every gathered row: ordinary forward hooks
+        # and useful-FLOP accounting retain the original full projection shape.
+        output = method.apply_prepared(self, input_, None, input_is_rotated=True)
+        return (output, None) if self.return_bias else output
+
+
+class H3QKVParallelLinear(_H3RotatedColumnInput, QKVParallelLinear):
+    """QKV projection accepting explicitly rotated, gathered FP16 rows."""
+
+
+class H3MergedColumnParallelLinear(_H3RotatedColumnInput, MergedColumnParallelLinear):
+    """Gate/up projection accepting explicitly rotated, gathered FP16 rows."""
 
 
 class H3RowParallelLinear(RowParallelLinear):

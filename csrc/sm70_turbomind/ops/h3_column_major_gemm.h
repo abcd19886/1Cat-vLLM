@@ -38,6 +38,15 @@ class H3ColumnMajorGemmPlan {
       check(cublasLtMatmulPreferenceCreate(&preference_));
       size_t workspace_bytes = 0;
       uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_NONE;
+      // Match run()'s 16-byte operand contract. The library otherwise assumes
+      // 256-byte alignment while selecting a heuristic for offset views.
+      uint32_t alignment = 16;
+      check(cublasLtMatmulPreferenceSetAttribute(
+          preference_, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &alignment,
+          sizeof(alignment)));
+      check(cublasLtMatmulPreferenceSetAttribute(
+          preference_, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &alignment,
+          sizeof(alignment)));
       check(cublasLtMatmulPreferenceSetAttribute(
           preference_, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
           &workspace_bytes, sizeof(workspace_bytes)));

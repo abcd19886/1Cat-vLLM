@@ -44,7 +44,25 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--int8-weight-layout", choices=["row", "column"], default="column"
             )
+            mode.add_argument(
+                "--residual-sequence-parallel",
+                action="store_true",
+                help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
+            )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
+            mode.add_argument(
+                "--host-memory-mode",
+                choices=("auto", "pinned", "mmap"),
+                default="auto",
+                help="Use disk-backed CPU weights on hosts below 128 GiB RAM",
+            )
+            mode.add_argument("--host-memory-directory")
+            mode.add_argument(
+                "--video-encoder",
+                choices=("libx264", "h264_nvenc"),
+                default="libx264",
+                help="MP4 encoder; NVENC requires a capable IMAGEIO_FFMPEG_EXE",
+            )
             if name == "generate":
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
                 mode.add_argument("--width", type=int, default=1344)
@@ -98,6 +116,10 @@ class VideoSubcommand(CLISubcommand):
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             lora_path=args.lora_path,
             int8_weight_layout=args.int8_weight_layout,
+            residual_sequence_parallel=args.residual_sequence_parallel,
+            video_encoder=args.video_encoder,
+            host_memory_mode=args.host_memory_mode,
+            host_memory_directory=args.host_memory_directory,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

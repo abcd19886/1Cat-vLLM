@@ -83,6 +83,21 @@ def test_missing_plan_falls_back_without_changing_math(monkeypatch):
 
 
 @cuda
+def test_plan_accepts_16_byte_offsets_advertised_to_heuristic():
+    torch.manual_seed(42)
+    m, n, k = 12352, 5376, 1792
+    x = torch.randn(m * k + 8, device="cuda", dtype=torch.float16)[8:].view(m, k)
+    weight = torch.randn(n * k + 8, device="cuda", dtype=torch.float16)[8:]
+    weight = weight.view(k, n).t()
+    assert x.data_ptr() % 256 == weight.data_ptr() % 256 == 16
+    plan = cuda_ops._column_major_plan(x.get_device(), m, n, k, True)
+    assert plan.supported
+    actual = plan.run(x, weight)
+    expected = cuda_ops.w8a16_extension().gemm(x, weight.contiguous(), True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@cuda
 def test_column_plan_rejects_shape_dtype_and_device_mismatch():
     ops = cuda_ops.w8a16_extension()
     plan = ops.ColumnMajorGemmPlan(
