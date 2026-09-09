@@ -27,6 +27,31 @@ CUTLASS v4.4.2 source. It does not rebuild the rest of vLLM. The normal CMake
 build fetches that pinned CUTLASS version automatically.
 The development tests use Transformers 5.15.1 and Diffusers 0.40.0.
 
+## Host memory and temporary disk storage
+
+Four 32-GB GPUs do not imply that the host can retain the complete CPU model.
+Pinned DiT and text-encoder masters exhausted a 64-GiB host during TP4 loading.
+`--host-memory-mode auto` therefore uses reclaimable, disk-backed CPU weights
+on hosts with less than 128 GiB of physical RAM. Larger hosts retain the pinned
+path. `--host-memory-mode mmap` or `pinned` selects a policy explicitly.
+
+The disk-backed path preserves tensor bytes, aliases, strides and dtypes;
+quantization, attention and denoise schedules are unchanged. Parameters are
+mapped before streaming checkpoint writes, avoiding a complete anonymous CPU
+copy before offload. Storage transformed during quantization and adapter
+preparation is mapped again before staging. Device transfers from these CPU
+masters may take longer than transfers from pinned RAM.
+
+Temporary storage defaults to `VLLM_CACHE_ROOT/h3-host`. Use
+`--host-memory-directory /path/on/local-ssd` to select another directory.
+Each allocation reserves disk space before mapping so a full disk reports a
+loading error instead of a later SIGBUS. Files are immediately unlinked after
+mapping; their space remains occupied until the worker releases the tensors,
+including after an abrupt worker exit. Original model files remain read-only.
+Provide enough free SSD space for the selected model's CPU weights. This mode
+reduces weight residency; it does not eliminate activation or media-processing
+memory requirements.
+
 ```bash
 export CUDA_HOME=/path/to/cuda-12.8
 export TORCH_CUDA_ARCH_LIST=7.0
@@ -149,8 +174,17 @@ matrix dimensions and valid attention tokens, exclude padding/rotation/dequant,
 and divide by the maximum complete denoise duration across all four ranks.
 NVML utilization and standalone operator speed are diagnostic evidence only.
 
-The native engine reserves a whole available GPU group (0–3 first, then 4–7)
-with the shared 1Cat V100 per-card and group locks. The lease remains held until
+The native engine reserves a whole available GPU group with the shared 1Cat
+V100 per-card and group locks. An explicit `CUDA_VISIBLE_DEVICES` selection
+(NVML indices or GPU UUIDs) bounds the candidate groups; a busy selected group
+never falls back to unselected devices. UUIDs are recommended for launchers.
+Without a selection, devices with at least 30 GiB capacity form ordered groups,
+so a small display card does not shift the four-V100 grouping. Workers receive
+the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences.
+The NVML platform resolves these UUIDs for physical-device queries before
+pipeline imports, so capability checks use the same selected boards. Custom
+all-reduce topology checks use this mapping as well.
+The lease remains held until
 its workers exit. A group reserved by another cooperating task is unavailable
 even while that task is between CUDA processes. If both groups are occupied or
 reserved, startup fails before model loading.
