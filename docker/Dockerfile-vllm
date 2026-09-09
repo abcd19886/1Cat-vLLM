@@ -859,6 +859,15 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
+# Install the optional `video` extra for the native MiniMax H3 entrypoints
+(`vllm video generate` / `vllm video serve`). vllm/video imports these at
+module level, so the stock image must carry them. Keep in sync with the
+`video` extra in setup.py.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system 'diffusers==0.40.0' 'av>=14' 'imageio>=2.37.2' \
+        'imageio-ffmpeg>=0.6' 'soundfile>=0.13' scipy einops omegaconf \
+        'accelerate>=1.12' nvidia-ml-py
+
 # Download FlashInfer precompiled cubins AFTER all pip installs are done.
 # This must run after the vLLM wheel and EP kernels installs above, because
 # those can reinstall/touch flashinfer packages. Downloading cubins earlier
