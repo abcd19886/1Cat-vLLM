@@ -860,9 +860,9 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # Install the optional `video` extra for the native MiniMax H3 entrypoints
-(`vllm video generate` / `vllm video serve`). vllm/video imports these at
-module level, so the stock image must carry them. Keep in sync with the
-`video` extra in setup.py.
+# (`vllm video generate` / `vllm video serve`). vllm/video imports these at
+# module level, so the stock image must carry them. Keep in sync with the
+# `video` extra in setup.py.
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system 'diffusers==0.40.0' 'av>=14' 'imageio>=2.37.2' \
         'imageio-ffmpeg>=0.6' 'soundfile>=0.13' scipy einops omegaconf \
