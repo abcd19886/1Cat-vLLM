@@ -544,8 +544,7 @@ class cmake_build_ext(build_ext):
             )
             if os.path.exists(triton_kernels_build):
                 print(
-                    f"Copying {triton_kernels_build} "
-                    "to vllm/third_party/triton_kernels"
+                   f"Copying {triton_kernels_build} to vllm/third_party/triton_kernels"
                 )
                 shutil.copytree(
                     triton_kernels_build,
