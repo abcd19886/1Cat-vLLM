@@ -22,7 +22,6 @@ from PIL import Image
 from torch import nn
 from tqdm.auto import tqdm
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
-
 from vllm import envs
 from vllm.distributed import get_tp_group, get_world_group
 from vllm.logger import init_logger
@@ -46,7 +45,7 @@ from .config import (
     H3Request,
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
-from .encoder import MiniMaxH3Qwen3VLEncoder
+from .encoder import MiniMaxH3Qwen3VLEncoder, build_encoder_int8_config
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -74,7 +73,7 @@ from .preprocessing import (
 from .preprocessing import (
     resolve_minimax_h3_reference_image_shape as _reference_image_shape,
 )
-from .quantization import DiffusionInt8ConvRotConfig
+from .quantization import DiffusionInt8ConvRotConfig, Int8ConvRotLinearMethod
 from .reference_video import (
     load_audio_file,
     load_video_audio,
@@ -616,17 +615,24 @@ class MiniMaxH3Pipeline(nn.Module):
         self.processor = Qwen3VLProcessor.from_pretrained(
             str(shared / "processor"), local_files_only=True
         )
+        encoder_quant = build_encoder_int8_config(shared / "text_encoder")
         self.text_encoder = MiniMaxH3Qwen3VLEncoder(
             str(shared / "text_encoder"),
             device=self.device,
             load_model=True,
             encoder_group=self.text_encoder_group,
+            quant_config=encoder_quant,
         )
         if self._host_backing is not None:
             PinnedModuleStager.map_cpu_weights(
                 self.text_encoder, self._host_backing, preserve_parameters=False
             )
         self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
+        if encoder_quant is not None:
+            for layer in self.text_encoder.modules():
+                method = getattr(layer, "quant_method", None)
+                if isinstance(method, Int8ConvRotLinearMethod):
+                    method.process_weights_after_loading(layer)
         self._encoder_stager = PinnedModuleStager(
             self.text_encoder,
             self.device,

@@ -9,6 +9,20 @@ from pathlib import Path
 LOCK_ROOT = Path("/tmp")
 
 
+def _capacity_limits() -> tuple[int, int, int]:
+    """Return (min_total, min_free, max_foreign) byte thresholds.
+
+    Defaults preserve the original 32-GB-card contract. Smaller boards
+    (e.g. 16-GB V100s) lower the thresholds explicitly through the
+    environment instead of editing this file.
+    """
+    gib = 1024**3
+    min_total = int(float(os.environ.get("VLLM_H3_MIN_TOTAL_GIB", "30")) * gib)
+    min_free = int(float(os.environ.get("VLLM_H3_MIN_FREE_GIB", "30")) * gib)
+    max_foreign = int(float(os.environ.get("VLLM_H3_MAX_FOREIGN_MB", "256")) * 1024**2)
+    return min_total, min_free, max_foreign
+
+
 def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
     import pynvml as nvml
 
@@ -18,6 +32,7 @@ def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
     nvml.nvmlInit()
     try:
         count = nvml.nvmlDeviceGetCount()
+        min_total, min_free, max_foreign = _capacity_limits()
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if visible is not None:
             if not visible.strip() or visible.strip() == "-1":
@@ -43,7 +58,7 @@ def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
             indices = []
             for index in range(count):
                 handle = nvml.nvmlDeviceGetHandleByIndex(index)
-                if nvml.nvmlDeviceGetMemoryInfo(handle).total >= 30 * 1024**3:
+                if nvml.nvmlDeviceGetMemoryInfo(handle).total >= min_total:
                     indices.append(index)
         for start in range(0, len(indices), tp):
             group = tuple(indices[start : start + tp])
@@ -54,9 +69,9 @@ def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
                 handle = nvml.nvmlDeviceGetHandleByIndex(index)
                 processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
                 # Ignore a small desktop CUDA allocation; never displace jobs.
-                if any(p.usedGpuMemory > 256 * 1024**2 for p in processes):
+                if any(p.usedGpuMemory > max_foreign for p in processes):
                     available = False
-                if nvml.nvmlDeviceGetMemoryInfo(handle).free < 30 * 1024**3:
+                if nvml.nvmlDeviceGetMemoryInfo(handle).free < min_free:
                     available = False
             if available:
                 groups.append(group)

@@ -33,18 +33,19 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from .ops import RMSNorm as DiffusionRMSNorm
+from .quantization import DiffusionInt8ConvRotConfig, Int8ConvRotLayerConfig
 from .residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -398,6 +399,11 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         loaded_shard_id: str | None = None,
     ) -> None:
         del loaded_shard_id
+        # Per-output-row INT8 scales carry no input dimension, so row
+        # parallelism does not shard them; copy them whole.
+        if getattr(param, "input_dim", None) is None:
+            param.data.copy_(loaded_weight)
+            return
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
@@ -1233,6 +1239,72 @@ def _get_rope_index(
     return position_ids, mrope_position_deltas
 
 
+def _map_encoder_layer_prefix(marker_prefix: str) -> str | None:
+    """Map a ComfyUI INT8 ``.comfy_quant`` marker prefix to the encoder's
+    internal module prefix (the key looked up by ``get_quant_method``)."""
+    if not marker_prefix.startswith("model.layers."):
+        return None
+    rest = marker_prefix[len("model.layers.") :]
+    for proj, fused in (
+        (".self_attn.q_proj", ".self_attn.qkv_proj"),
+        (".self_attn.k_proj", ".self_attn.qkv_proj"),
+        (".self_attn.v_proj", ".self_attn.qkv_proj"),
+        (".mlp.gate_proj", ".mlp.gate_up_proj"),
+        (".mlp.up_proj", ".mlp.gate_up_proj"),
+    ):
+        if rest.endswith(proj):
+            return "text_encoder.text_model.layers." + rest[: -len(proj)] + fused
+    return "text_encoder.text_model.layers." + rest
+
+
+def build_encoder_int8_config(
+    checkpoint_path: str | Path,
+) -> DiffusionInt8ConvRotConfig | None:
+    """Parse a ComfyUI INT8 text-encoder checkpoint's ``.comfy_quant`` markers.
+
+    Returns a ``DiffusionInt8ConvRotConfig`` keyed by the encoder's internal
+    module prefixes, or ``None`` when the checkpoint is not INT8-quantized
+    (no markers), in which case the encoder loads as plain BF16/FP16.
+    """
+    import json
+
+    from safetensors import safe_open
+
+    path = Path(checkpoint_path)
+    files = [path] if path.is_file() else sorted(path.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"no safetensors checkpoint at {path}")
+    layer_configs: dict[str, Int8ConvRotLayerConfig] = {}
+    for file in files:
+        with safe_open(file, framework="pt", device="cpu") as checkpoint:
+            for name in checkpoint.keys():  # noqa: SIM118 (safe_open is not iterable)
+                if not name.endswith(".comfy_quant"):
+                    continue
+                internal_prefix = _map_encoder_layer_prefix(
+                    name[: -len(".comfy_quant")]
+                )
+                if internal_prefix is None:
+                    continue
+                marker = checkpoint.get_tensor(name)
+                if marker.dtype != torch.uint8 or marker.dim() != 1:
+                    raise ValueError(
+                        f"{name} must be a one-dimensional uint8 JSON tensor, got "
+                        f"{marker.dtype} {tuple(marker.shape)}."
+                    )
+                decoded = json.loads(bytes(marker.tolist()).decode("utf-8"))
+                config = Int8ConvRotLayerConfig.from_mapping(decoded)
+                existing = layer_configs.get(internal_prefix)
+                if existing is not None and existing != config:
+                    raise ValueError(
+                        f"Conflicting Comfy quant metadata for {internal_prefix}: "
+                        f"{existing} vs {config}."
+                    )
+                layer_configs[internal_prefix] = config
+    if not layer_configs:
+        return None
+    return DiffusionInt8ConvRotConfig(layer_configs=layer_configs)
+
+
 # ---------------------------------------------------------------------------
 # Encoder entry point.
 # ---------------------------------------------------------------------------
@@ -1285,7 +1357,15 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        self.text_model.to(dtype=dtype)
+        # The INT8 ConvRot weights are created in their final dtype (INT8
+        # weight + FP32 scale); a blanket ``.to(dtype)`` would upcast them and
+        # corrupt the checkpoint.  The BF16/FP16 params are already built in
+        # ``dtype``, so the cast is only needed on the unquantized path.
+        if not getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False):
+            self.text_model.to(dtype=dtype)
+        validate_bindings = getattr(quant_config, "validate_model_bindings", None)
+        if callable(validate_bindings):
+            validate_bindings(self.text_model)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, "
             "text_encoder_tp_size=%d, vision replicated",
@@ -1302,6 +1382,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self._tp_size
 
     def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
+        # ComfyUI INT8 checkpoints carry a per-layer ``.comfy_quant`` marker
+        # tensor; it is checkpoint protocol metadata, not executable state.
+        if name.endswith(".comfy_quant"):
+            return None
+        # ComfyUI INT8 checkpoints use a flatter naming scheme than the HF
+        # checkpoint; normalize it so both share the mapping below.
+        if name.startswith("model.layers."):
+            name = "model.language_model." + name[len("model.") :]
+        elif name.startswith("visual."):
+            name = "model.visual." + name[len("visual.") :]
+        elif name == "model.embed_tokens.weight":
+            name = "model.language_model.embed_tokens.weight"
         if name == "lm_head.weight" or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
@@ -1316,42 +1408,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 and int(match.group(1)) >= MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER
             ):
                 return None
-            if ".self_attn.q_proj.weight" in rest:
-                return (
-                    "text_model."
-                    + rest.replace(
-                        ".self_attn.q_proj.weight", ".self_attn.qkv_proj.weight"
-                    ),
-                    "q",
-                )
-            if ".self_attn.k_proj.weight" in rest:
-                return (
-                    "text_model."
-                    + rest.replace(
-                        ".self_attn.k_proj.weight", ".self_attn.qkv_proj.weight"
-                    ),
-                    "k",
-                )
-            if ".self_attn.v_proj.weight" in rest:
-                return (
-                    "text_model."
-                    + rest.replace(
-                        ".self_attn.v_proj.weight", ".self_attn.qkv_proj.weight"
-                    ),
-                    "v",
-                )
-            if ".mlp.gate_proj.weight" in rest:
-                return (
-                    "text_model."
-                    + rest.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"),
-                    0,
-                )
-            if ".mlp.up_proj.weight" in rest:
-                return (
-                    "text_model."
-                    + rest.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"),
-                    1,
-                )
+            # Fused projections: the checkpoint stores q/k/v (and gate/up)
+            # separately; map each shard onto the fused parameter.  The same
+            # row layout applies to the per-row INT8 ``weight_scale``.
+            for proj, fused, shard in (
+                (".self_attn.q_proj.", ".self_attn.qkv_proj.", "q"),
+                (".self_attn.k_proj.", ".self_attn.qkv_proj.", "k"),
+                (".self_attn.v_proj.", ".self_attn.qkv_proj.", "v"),
+                (".mlp.gate_proj.", ".mlp.gate_up_proj.", 0),
+                (".mlp.up_proj.", ".mlp.gate_up_proj.", 1),
+            ):
+                if proj in rest:
+                    return ("text_model." + rest.replace(proj, fused), shard)
             return ("text_model." + rest, None)
         return None
 

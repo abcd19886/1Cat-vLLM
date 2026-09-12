@@ -1,3 +1,52 @@
+docker run -d \
+  --name qwen3.8-27b-dflash2 \
+  --gpus '"device=0,1,2,3"' \
+  --shm-size=32g \
+  -e VLLM_SH70_BACKEND=turbomind \
+  -e VLLM_SH70_FLASH_ATTN_V100=1 \
+  -e VLLM_SH70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 \
+  -v /data/models/Qwen/Qwen3___8-27B-FP8:/models/Qwen3___8-27B-FP8 \
+  -v /data/models/incoai/Qwen3___8-27B-DFlash2:/models/Qwen3___8-27B-DFlash2 \
+  -v /data/vllm_cache:/cache \
+  -p 8002:8000 \
+ghcr.1ms.run/abcd19886/1cat-vllm:latest \
+  --model /models/Qwen3___8-27B-FP8 \
+  --served-model-name qwen3.8-27b-fp8 \
+  --trust-remote-code \
+  --attention-backend FLASH_ATTN_V100 \
+  --tensor-parallel-size 4 \
+  --dtype half \
+  --kv-cache-dtype fp8_e5m2 \
+  --gpu-memory-utilization 0.905 \
+  --max-model-len 262144 \
+  --max-num-seqs 2 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --max-num-batched-tokens 2048 \
+  --limit-mm-per-prompt '{"image":999,"video":0}' \
+  --mm-processor-kwargs '{"max_pixels":2073680}' \
+  --mm-encoder-tp-mode weights \
+  --mm-processor-cache-gb 0 \
+  --speculative-config '{"method":"dflash","model":"/models/Qwen3___8-27B-DFlash2","kv_cache_dtype":"fp8_e5m2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","draft_sample_method":"greedy"}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --chat-template /models/Qwen3___8-27B-FP8/chat_template.jinja \
+  --default-chat-template-kwargs '{"enable_thinking":true,"reasoning_effort":"medium"}' \
+  --async-scheduling \
+  --enable-prompt-tokens-details \
+  --enable-flashinfer-autotune \
+  --optimization-level 3 \
+  --gdn-prefill-backend flashqla_sm70 \
+  --api-key "2026" \
+  --host 0.0.0.0 \
+  --port 8000
+
+
+
+
+
+
 1Cat-vLLM 构建修复过程（2026-09-06 01:47 – 05:22）
 重要信息要写入到readme.txt里面,已经实现的要说明一下
 仓库 abcd19886/1Cat-vLLM · 目标：V100 / SM70 专用 vLLM fork 构建成功
@@ -25,3 +74,58 @@ Fine-grained PAT 无 Actions 写权限 → dispatch 返回 403。用户改提供
 - USE_SCCACHE=1 会用 sccache（不是 ccache）缓存编译产物到 /root/.cache/sccache
 - 第一次构建会写入缓存，第二次起只要不改 Dockerfile 就能复用，97 targets 会从缓存读取
 - 监控 sccache 统计：构建日志搜 "sccache --show-stats"，看 Cache hits 数量
+⑨ MiniMax-H3 INT8 ConvRot 文本编码器 + GPU 租约阈值（2026-09-12）
+背景：/data/models/MiniMax-H3 的文本编码器换成了 ComfyUI INT8 量化版
+qwen3vl_32b_minimax_h3_int8_convrot.safetensors（27GB，单文件）。
+检查点结构：50 层 × 7 个投影（q/k/v/o/gate/up/down）= 350 个 INT8 张量，
+全部 int8_tensorwise + ConvRot（groupsize 256），每层带 .comfy_quant
+uint8 JSON 标记张量；视觉塔/embedding/layernorm 保持 BF16（视觉塔带 bias）。
+DiT 已有完整 ConvRot-int8 路径（DiffusionInt8ConvRotConfig +
+Int8ConvRotLinearMethod + w8a16 CUDA 扩展），本次把它移植到文本编码器。
+
+已实现（工作区未提交）：
+1) vllm/model_executor/models/minimax_h3/encoder.py
+   - build_encoder_int8_config()：解析检查点 .comfy_quant 标记，映射到编码器
+     内部模块前缀（q/k/v→qkv_proj、gate/up→gate_up_proj 融合层），
+     同一融合层多个标记冲突时报错；无标记返回 None（走 BF16/FP16 原路径）。
+   - _map_weight_name()：兼容 ComfyUI 扁平命名（model.layers.* / visual.* /
+     model.embed_tokens.*），跳过 .comfy_quant 元数据张量。
+   - MiniMaxH3Qwen3VLEncoder 接受 quant_config；INT8 路径跳过整体 .to(dtype)
+     （INT8 权重 + FP32 scale 不能上转换）；构造后调用
+     validate_model_bindings 确保 350 个标记全部绑定到可执行层。
+   - 修复 RowParallelLinear.weight_loader：weight_scale 是每输出行 scale
+     （[N,1]，无 input_dim），行并行不切分，必须整体拷贝；原实现按 dim1
+     narrow 会越界崩溃（o_proj/down_proj 都是行并行）。
+2) vllm/model_executor/models/minimax_h3/pipeline.py
+   - 构造编码器前 build_encoder_int8_config(shared/"text_encoder")，
+     传入 quant_config；load_weights 后对所有 Int8ConvRotLinearMethod 层
+     调 process_weights_after_loading（校验 INT8/FP32 scale 并整理布局）。
+3) vllm/video/gpu.py（GPU 租约阈值补丁）
+   - 原硬编码 30GB 总量/30GB 空闲/256MB 外部占用阈值，16GB V100 永远租不到。
+   - 新增环境变量覆盖：VLLM_H3_MIN_TOTAL_GIB（默认 30）、
+     VLLM_H3_MIN_FREE_GIB（默认 30）、VLLM_H3_MAX_FOREIGN_MB（默认 256）。
+     16GB 卡示例：VLLM_H3_MIN_TOTAL_GIB=15 VLLM_H3_MIN_FREE_GIB=15。
+
+TP4 ConvRot 对齐验证（config: hidden 5120 / intermediate 25600 /
+heads 64 / kv_heads 8 / head_dim 128）：
+   qkv/gate_up 输入 5120%256=0；o_proj 本地 8192/4=2048%256=0；
+   down_proj 本地 25600/4=6400%256=0。全部满足。
+
+验证结果（1cat-vllm 镜像 + 工作区代码，CPU 参考路径 + V100 SM70 CUDA 路径）：
+   - TP1 CPU：200 个量化层（350 标记按融合层归并）全部加载，50 层
+     encode_ids 前向通过，输出 (4,5120) 有限值。
+   - TP4 CPU（4 线程 barrier all_reduce 模拟）：与 TP1 参考 mean_rel=3.3e-3
+     （fp16 舍入量级），4 个 rank 输出完全一致 → 列切分/行切分/scale 加载/
+     ConvRot 分组对齐全部正确。
+   - CUDA（V100 GPU4）：layer0 四种投影（qkv/o/gate_up/down）走 w8a16
+     扩展（rotate+dequantize+fp16_gemm）与 CPU 参考 mean_rel≈3e-6，通过。
+   - ruff check + format（v0.14.0，仓库规则）：encoder.py / pipeline.py 通过。
+
+注意：
+   - 编码器 INT8 权重不做 h3_fp16_weight 缓存（DiT 有预算缓存），每次前向
+     现场 dequantize——16GB 卡上缓存 fp16 副本（每卡 ~13.5GB）放不下。
+   - FL2VA/text_encoder/ 目录里旧的 model.safetensors.index.json 指向已不存在的
+     HF 分片，无害（iter_checkpoint_weights 只 glob *.safetensors）；
+     int8 文件以软链接放入该目录。
+   - 测试脚本：/tmp/test_encoder_int8.py（tp1/tp4 两阶段）、
+     /tmp/test_encoder_cuda.py（GPU 单层对照）。
