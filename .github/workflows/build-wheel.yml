@@ -28,7 +28,7 @@ jobs:
       vllm_commit: ${{ steps.check.outputs.vllm_commit }}
     steps:
       - name: Checkout 1Cat-vLLM source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ inputs.ref }}
@@ -80,9 +80,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Checkout 1Cat-vLLM source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ needs.check-and-build.outputs.vllm_commit }}
