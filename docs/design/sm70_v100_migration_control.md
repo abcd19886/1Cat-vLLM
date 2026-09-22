@@ -2,6 +2,79 @@
 
 Date: 2026-05-30
 
+## Memory reuse defaults, 2026-09-22
+
+[Candidate implementation and validation contract](sm70_memory_defaults.md).
+Based on merged PR666/main949728e891, this scope removes duplicate weight/scale
+storage and native score workspaces without narrowing TP or concurrency gates.
+Shared codes and compact scales default on, with capability fallback and explicit
+rollback. Reusable scale scratch removes the capture-size<=32 restriction;
+Q8000/Q8192 and the tail share scores; SM70 V2 reserves graph memory before KV.
+See the linked report for the exact native capability and stream contracts.
+
+Matched TP4/27B NVFP4/DFlash2/7/E4M3/FP16-draft/185W/CUDA-Graph validation
+reduces model loading from10.07 to6.47 GiB/rank, with KV budget10.57 to12.68 GiB.
+Cold256000/256 prefill changes2069.8 to2061.5 tok/s (-0.40%); fixed-seed C32
+aggregate output throughput averages+0.91%. More resident requests increase
+per-request TPOT; do not hide it behind aggregate throughput. All C1-C32 bench
+requests and32K/128K/exact262144-boundary retrieval requests complete.
+
+MBPP32 remains25/32 main versus24/32 candidate; the candidate has no truncated
+answers, while main has one. The discordant item144 is also main-only correct
+in a serial sampled check. A separate complete C1/temperature-zero diagnostic
+produces15756 tokens and identical complete response text, passing in both modes.
+A same-native-build shared-off control reproduces that text; eight forced
+prefixes also have identical top20 logprob maps with shared storage on/off. Preserve both
+outcomes; the greedy diagnostic is not a replacement quality score or proof
+of global equivalence.504 real-projection cases match every FP16 output bit,
+including compact restoration and changed-input graph replay;40 GPU and19 CPU
+regressions pass. No effective-weight or attention accumulation precision was
+reduced to obtain the memory saving.
+
+TP2 on2x32GB passes32K retrieval with12.17 GiB model loading per rank. TP1 on32GB
+still fails KV admission with DFlash2/chunk8192/C32/utilization0.85. No physical
+16GB GPU was tested. The full-FP32 75T and35B migration targets remain open.
+Keep the interrupted audit and rejected experiments recorded in the report;
+do not repeat broad sampled sweeps solely to obtain a favorable score.
+
+## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
+
+Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see the
+[implementation and speed evidence](sm70_tp_shape_coverage.md) and
+[paired quality audit](sm70_tp_quality_audit.md). Default dispatch follows local
+head/matrix layout rather than TP1/TP2/TP4 allowlists. Promotion is paused
+for the quality investigation below. QK and PV accumulate in
+FP32, measuring70-71T;75T remains open. Do not attribute the older FP16-QK
+75T result to full FP32.
+
+The paired96-item audit completes without truncation: OFF/ON scores are
+GSM8K30/30, MATH50032/32 and MBPP26/25. The small difference does not establish
+statistical equivalence. Three deterministic discordant-case diagnostics also
+retain all failures. Both modes shared an exact-capacity DFlash failure;
+commit316e04a1ec materializes accepted Mamba state before a single-token tail.
+The original262128-input request now returns the correct16-token answer and
+naturally stops exactly at262144 total tokens. Eleven GPU state/graph checks pass.
+
+The follow-up isolates early greedy token differences to the projection
+accelerators: attention-only trajectories match the OFF control on all three
+short diagnostic probes. QPN2 prematurely rounds the global weight scale to
+FP16;12 checked real tensors have13-59% differing group scales. The repair
+matches the ordinary W4A16 effective weights and avoids rebias overflow.
+Twenty-four exact GPU cases pass; same-input FP64 audits put repaired QPN2
+and TurboMind at virtually identical error. The repaired32-item MBPP run
+scores23/32, versus25/32 for the fresh matched OFF control. All64 outputs
+finish naturally. This is not quality acceptance. Do not build another wheel;
+the user requested source/kernel diagnosis and repair instead.
+
+Earlier full-FP32 TP4 DFlash results include cold256K prefill about2511tok/s and
+C1-C32 client completion, with13 resident sequences. No-DFlash TP1/TP2 pass
+cold64K/256K and C1-C32; TP2 reaches32 resident sequences. TP1 27B+DFlash2 still
+exceeds chunk8192 profiling memory, and TP2 DFlash/256K needs the unpromoted
+shared-weight layout. These limits are not erased by removing TP gates.
+The missing matched35B-A3B AWQ/FP8 evidence remains a migration requirement;
+this PR does not claim that migration is complete. Rejected tuning and invalid
+measurements remain in the design note; do not repeat them without a new cause.
+
 ## Mamba state grid decoupled from the KV block size, 2026-09-17
 
 [Design note](sm70_mamba_state_grid_decoupling.md). The long-prefill chunk is
@@ -46733,3 +46806,42 @@ has launched no full model. Details and artifacts are in
   3.64x/6.12x/6.35x/6.46x/6.59x. Native attention admission has no batch or
   total-KV-length ceiling; services above B32 continue through piecewise CUDA
   graphs with the same accelerated attention route.
+
+## 2026-09-21 TP quality localization: normalization and mixed sampling
+
+- Continue owned PR666 on `codex/v100-tp-generalize-20260921-021932`, base
+  `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`. Native QPN2 scale repair remains
+  `_C` SHA256 `81db4a88972dc0fdf0c4a59cdb2128e7b9e875770ea0d510b0d398b599222ccd`.
+  This round changes Python source only; no wheel rebuild or eager serving.
+- Fixed-token/fixed-q8 captures distinguish target arithmetic from changed
+  DFlash proposals. Real-activation FP64 checks cover all 256 target projections
+  at sampled output columns. Neither repaired QPN2 nor ordinary TurboMind shows
+  a large local numerical error. Actual-hidden LM-head checks find no missing
+  exact top-21 candidates in 900 vocabulary-shard rows. Do not repeat those
+  broad probes without a new counterexample.
+- The earliest prefill drift is layer-0 input RMSNorm: seven FP16 values differ
+  across runs/ranks, before projection or GDN. Enable the existing fixed
+  reduction in the DFlash2 default profile. With that setting, all captured
+  prefill projections, GDN intermediates and final hidden states match exactly
+  across the QPN2 ON/OFF pair. Decode arithmetic still differs; zero top-1 flips
+  in 225 fixed positions is not a natural-output quality pass.
+- Repair a separate compact-sampling guard that applied the first request's
+  temperature/top-p to every request. Expand parameters by packed logit counts
+  and request-state mapping; retain general concurrent dispatch. The original
+  caller fails the heterogeneous-batch regression. This does not explain the
+  earlier homogeneous-parameter MBPP score gap.
+- See `sm70_tp_quality_audit.md` for retained r20-r25 evidence. Uninstrumented
+  r26/r27 MBPP32 completes at ON24/32 versus OFF25/32, all64naturalEOS;
+  item144is the only OFF-only correct case. Both answers contain the correct
+  nth-decagonal formula but assign different behavior to the required function
+  name. Keep this difference and the quality gate open; do not hide it with
+  prompt changes or a favorable rerun. Full C1 greedy144 is a separate diagnostic.
+- Complete greedy144 reverses the direction: ON passes after13413tokens,
+  OFF fails after14878; both stop naturally with identical C1/temperature-zero
+  requests. This is not a replacement for the C4sampled24/25 result. Avoid
+  repeating score sweeps without a concrete new numerical counterexample.
+- vLLM bench C1/C4 full-request output TPS is ON176.3946/189.2527 versus
+  OFF119.6903/160.0622 at2048input/256output. Both cold262128+16boundary checks
+  pass with naturalEOS; ON/OFF TTFT132.3341/174.3433s. Do not infer long-context
+  decode speed from that16-token answer. The75T full-FP32 target and35B-A3B
+  AWQ/FP8 migration baselines are not resolved by this change.
