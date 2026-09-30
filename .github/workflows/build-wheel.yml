@@ -160,7 +160,7 @@ jobs:
           # disables the S3 remote cache so the BuildKit cache mount (persisted
           # via cache-to: type=gha) is the only cache backend.
           build-args: |
-            USE_SCCACHE=1
+            USE_SCCACHE=0
             SCCACHE_BUCKET_NAME=
             torch_cuda_arch_list=7.0
 
