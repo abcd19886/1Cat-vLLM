@@ -3,12 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: '1Cat-vLLM branch / tag / commit to build from (e.g. main, v1.5.0, a1b2c3d). Leave empty for main.'
+        description: '1Cat-vLLM branch / tag / commit to build from (e.g. main, v1.5.1, a1b2c3d). Leave empty for main.'
         required: false
         default: 'main'
         type: string
       image_tag:
-        description: 'Docker image tag (e.g. v1.5.0). Leave empty to auto-detect from git tag.'
+        description: 'Docker image tag (e.g. v1.5.1). Leave empty to auto-detect from git tag.'
         required: false
         type: string
 permissions:
@@ -19,9 +19,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VLLM_REPO: abcd19886/1Cat-vLLM
+
 jobs:
   check-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # 【优化】锁定22.04，规避2026-10 ubuntu-latest升级到26.04的风险
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version_tag: ${{ steps.check.outputs.version_tag }}
@@ -34,7 +35,8 @@ jobs:
           ref: ${{ inputs.ref }}
           submodules: true
           fetch-depth: 0
-      - name: Determine version & check image
+
+      - name: Determine version & check image exists on GHCR
         id: check
         run: |
           COMMIT=$(git rev-parse --short HEAD)
@@ -47,22 +49,21 @@ jobs:
             VERSION="${TODAY}"
           fi
           echo "Image tag: ${VERSION}"
-          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+          IMAGE_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_TAG="${{ env.REGISTRY }}/${IMAGE_LOWER}:${VERSION}"
           echo "Checking if ${IMAGE_TAG} already exists..."
-          RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/v2/$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" \
-            -H "Accept: application/vnd.oci.image.manifest.v1+json" 2>/dev/null || echo "000")
-          if [ "${RESPONSE}" = "200" ] || [ "${RESPONSE}" = "401" ]; then
-            TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:${{ env.IMAGE_NAME }}:pull" \
-              | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
-            if [ -n "${TOKEN}" ]; then
-              RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer ${TOKEN}" \
-                -H "Accept: application/vnd.oci.image.manifest.v1+json" \
-                "https://ghcr.io/v2/$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')/manifests/${VERSION}" 2>/dev/null || echo "000")
-            fi
+
+          # 简化GHCR镜像存在检测逻辑
+          TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:${IMAGE_LOWER}:pull" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+          RESPONSE="000"
+          if [ -n "${TOKEN}" ]; then
+            RESPONSE=$(curl -sL -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${IMAGE_LOWER}/manifests/${VERSION}" 2>/dev/null || echo "000")
           fi
+
           if [ "${RESPONSE}" = "200" ]; then
             echo "Image ${IMAGE_TAG} already exists. Skipping build."
             echo "should_build=false" >> "${GITHUB_OUTPUT}"
@@ -73,27 +74,25 @@ jobs:
           echo "version_tag=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "vllm_commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
-
   build:
     needs: check-and-build
     if: needs.check-and-build.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # 和上面job保持一致系统版本
+    timeout-minutes: 180 #【优化】增加超时，NVCC编译很慢，3小时超时
     steps:
       - name: Checkout main repo
         uses: actions/checkout@v7
+
       - name: Checkout 1Cat-vLLM source
         uses: actions/checkout@v7
         with:
           repository: abcd19886/1Cat-vLLM
           ref: ${{ needs.check-and-build.outputs.vllm_commit }}
           path: vllm-source
-      - name: Git submodule init
-        run: |
-          cd vllm-source
-          git submodule sync
-          git submodule update --init --recursive
+          submodules: true #【优化】直接在这里开启submodule，省去单独submodule命令
+          fetch-depth: 0
 
-      - name: Enable swap memory
+      - name: Enable swap memory (8G)
         run: |
           SWAP_PATH="/home/runner/swap8g"
           rm -f "${SWAP_PATH}"
@@ -106,20 +105,23 @@ jobs:
           sudo swapon "${SWAP_PATH}"
           swapon --show
 
-
-      - name: Free disk space
+      - name: Free disk space (increase available storage for CUDA build)
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /var/lib/apt/lists/*
           sudo apt clean
           df -h
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container # 推荐，更好支持cache
+          buildkitd-flags: --allow-insecure-entitlement security.insecure
 
-      - name: Log in to Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -134,40 +136,30 @@ jobs:
           echo "image=${{ env.REGISTRY }}/${IMAGE_LOWER}" >> "${GITHUB_OUTPUT}"
           echo "tag=${VERSION}" >> "${GITHUB_OUTPUT}"
 
-
-      - name: Build and push
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile-vllm2
           push: true
-          # no-cache: true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
           cache-from: type=gha
-          # mode=max (not min): export the cache even when the build fails,
-          # so sccache-compiled objects from finished steps survive a later
-          # packaging failure and are reused by the next build.
           cache-to: type=gha,mode=max
-          # NOTE: do NOT wrap the value in quotes. docker/build-push-action
-          # passes build-arg values verbatim, so `TORCH_CUDA_ARCH_LIST="7.0"`
-          # would leak literal quote characters into the env var and make
-          # PyTorch's CMake arch parser fail with
-          # "Found Unknown CUDA Architecture Name: \"7.0\"".
-          # This build targets only SM70 (V100 GPUs) with CUDA 12.8.
-          # USE_SCCACHE=1 enables sccache; SCCACHE_BUCKET_NAME= (empty)
-          # disables the S3 remote cache so the BuildKit cache mount (persisted
-          # via cache-to: type=gha) is the only cache backend.
+          # Build args 【重点优化】补齐CUDA/GDR版本参数，适配你的Dockerfile
           build-args: |
             USE_SCCACHE=0
             SCCACHE_BUCKET_NAME=
             torch_cuda_arch_list=7.0
+            CUDA_VERSION=12.8.1
+            GDRCOPY_CUDA_VERSION=12.8
+            VLLM_COMMIT=${{ needs.check-and-build.outputs.vllm_commit }}
 
       - name: Summary
         run: |
-          echo "### Docker Image Built (from source)" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### ✅ Docker Image Built (SM70 / V100 1Cat-vLLM)" >> "${GITHUB_STEP_SUMMARY}"
           echo "" >> "${GITHUB_STEP_SUMMARY}"
           echo "Image: \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`" >> "${GITHUB_STEP_SUMMARY}"
           echo "Also tagged: \`${{ steps.meta.outputs.image }}:latest\`" >> "${GITHUB_STEP_SUMMARY}"
-
+          echo "Build commit: \`${{ needs.check-and-build.outputs.vllm_commit }}\`" >> "${GITHUB_STEP_SUMMARY}"
