@@ -2,6 +2,25 @@
 
 Date: 2026-05-30
 
+## Pre-release packaging and video cancellation fixes, 2026-09-29
+
+The release audit against main `357d07bcb0ee` reproduced three P2 issues:
+precompiled reuse omitted the SM70 sparse-attention extension, full-CPython-ABI
+extensions could be labelled `cp38-abi3`, and cancelling queued video jobs
+retained uploaded references. Reuse now includes the sparse-attention library;
+wheel tags account for both extension declarations and precompiled package
+data; queued cancellation cleans request-owned inputs before returning.
+
+The focused packaging, Docker metadata, H3 host-memory and API suites pass
+67 tests, with two GPU tests skipped. All applicable pre-commit hooks pass.
+A tiny C-extension fixture also passes source wheel build, extraction,
+repackaging, installation and import in a fresh process: both wheels use
+`cp312-cp312`, retain the native file and reject CPython 3.11 compatibility.
+This is packaging evidence, not a full CUDA wheel or model qualification.
+Raw before/after logs and fixture hashes are retained in the
+`release-audit-20260928` evidence directory as `p2-*` artifacts. No inference
+kernel, benchmark threshold or performance claim changes in this patch.
+
 ## DFlash2 concurrent long decode follow-up, 2026-09-27
 
 Against main `1e90d17f` (PR #697), the new default candidate reaches the
@@ -47438,6 +47457,82 @@ has launched no full model. Details and artifacts are in
   readiness. It loads all 12 AOT artifacts without fallback and passes a chat
   request through Studio's authenticated public-API proxy. Existing model,
   topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-22 Studio startup follow-up: first-reload metadata and source hashes
+
+- Preserve the actual first artifacts before forcing their first reload. The
+  initial GPU0–3 run takes 261.74 seconds to fill an empty cache, then fails in
+  `FxGraphHashDetails -> kernel_side_table.get_kernel` on its first forced
+  reload. The Torch 2.10 bundled-AOT backport does not serialize the FX graph
+  owned by `VllmSerializableFunction` on the non-mega path.
+- Save only the Triton kernels and constant arguments referenced by that graph.
+  On reload, allocate current side-table indices and rewrite the loaded graph;
+  never overwrite another graph's entries. Preserve Dynamo-generated fixed
+  Autotuner configs, including explicit warp/stage counts. Importing only their
+  underlying JIT function would lose these execution settings. Unsupported
+  dynamic wrappers fail saving instead of silently changing their behavior.
+  Old artifacts with Triton nodes and no table require one regeneration;
+  artifacts without those nodes remain readable. The mega-AOT path is unchanged.
+- The initial backend key also differed from the reloaded key solely because
+  Dynamo included the synthetic filename `<frozen os>` and AOT `SourceInfo`
+  omitted it. Adding that literal to the restored file set exactly reproduces
+  the original hash. Exclude frozen/generated filenames from backend source
+  hashing, retaining real-file invalidation. This avoids recompiling the
+  Inductor artifacts even after the missing-table error is repaired.
+- The first implementation rejected generated fixed Autotuner wrappers as
+  non-importable. Retain this failed path: only the candidate-selector artifact
+  was saved; forcing reload then failed with FileNotFoundError. The corrected
+  implementation preserves the effective config and passes seven CPU cases:
+  empty/populated tables, ordinary/wrapped kernels, repeat serialization, legacy
+  artifacts, and source-content invalidation. Applicable pre-commit hooks pass.
+- Numerical diagnosis remains separate: the GPU0–3 logprob probe has 1387 tokens
+  with caching off and 1310 during the failed-save candidate fill. These requests
+  include logprobs and are not an exact replacement for the prior no-logprobs
+  production contract. The backbone FX text and all 128 normalized generated
+  Triton kernel sources match, but autotuning selected different launch configs
+  for 14 backbone, 13 draft, and one selector kernel. Eight changed backbone
+  configs alter reduction tiling, including 64 versus 256 element reductions.
+  This is a concrete lead, not a proven end-to-end explanation or a closed
+  cache-off/on quality gate; do not enable caching globally on that basis.
+- Raw artifacts, full traces, commands and effective-config differences are in
+  `/data/minimax-h3/task-cache/studio-startup-20260922/followup`. GPU0–3 was later
+  acquired by another task; the final same-contract validation uses production's
+  GPU4–7, preserving TP4, FP16, E5M2 KV, Flash-V100, full/piecewise graphs,
+  262144 context, 8192 batched tokens, four sequences, memory fraction 0.8,
+  prefix caching and DFlash2 seven-token probabilistic speculation. The first
+  corrected fill takes 256.71 seconds and reproduces the original cache-enabled
+  1764-token LRU response exactly. Native extension build time is excluded.
+- The corrected first forced reload takes 84.734 seconds, with all 12 AOT loads,
+  zero load failures and zero graph recompiles. However, the complete LRU answer
+  differs from its cold counterpart (both 1764 tokens, first difference in a
+  test-case comment/assertion). The strict cold/warm parity gate fails; the
+  later functional/tool checks were not reached. The deployment controller
+  restored the original qualified runtime; its engine starts in 84.165 seconds.
+  Do not promote this candidate or report its quality gate as passed.
+- The preserved first artifacts and post-reload cache differ in 23 effective
+  autotune configs, including one reduction changing R0_BLOCK from 64 to 256.
+  CPU-only inspection of bundled standalone artifacts finds 592 autotune
+  records, 136 keys and 17 keys with conflicting saved configurations. The
+  AOT setup shares the Inductor directory across TP ranks, while restoring each
+  standalone artifact writes its saved autotune entries to that directory.
+  This suggested a shared-cache collision; the next experiment tests that
+  hypothesis without changing sampling or native kernels.
+
+- Rejected rank-isolation experiment: per-rank Inductor directories take
+  263.679 seconds to fill and 90.750 seconds on the first forced reload, still
+  with 12 AOT loads and zero graph recompiles. Cold output exactly matches the
+  original cache-disabled 1654-token response, but warm output has 1387 tokens
+  and fails parity. There are still 18 effective config changes; 22 bundled
+  tuning keys conflict, including multiple subgraphs within a single rank.
+  The inspected reduction's saved and reconstructed config hashes match, so
+  a hash mismatch is not established as the cause. Rank isolation alone does
+  not solve the issue and is excluded from the implementation. Its patch and
+  all failed responses remain under `followup/rank-isolated/` for reproduction.
+- This second controller also restores the original qualified runtime (90.177
+  seconds engine-to-ready); no candidate is promoted. The first-reload loading
+  repair is verified, but the strict numerical/output parity investigation
+  remains open. Do not erase failed gates or repeatedly interrupt production
+  without a smaller reproducer for the remaining per-subgraph tuning drift.
 
 ## 2026-09-24 DFlash2 concurrent batch-layout candidate
 
