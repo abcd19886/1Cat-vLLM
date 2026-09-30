@@ -139,7 +139,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./docker/Dockerfile-vllm
+          file: ./docker/Dockerfile
           push: true
           # no-cache: true
           tags: |
