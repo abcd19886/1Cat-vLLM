@@ -199,6 +199,31 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _configure_sm70_dflash2_graph_cache(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+    cache_config: Any,
+) -> bool:
+    """Reuse compiled subgraphs without the unqualified AOT FX-graph reload."""
+    if (
+        envs.VLLM_DISABLE_COMPILE_CACHE
+        or not _is_sm70_dflash2_verifier_contract(
+            model_config, speculative_config, parallel_config
+        )
+        or model_config.quantization != "compressed-tensors"
+        or not model_config.is_nvfp4_quantized()
+        or parallel_config.tensor_parallel_size != 4
+        or cache_config.cache_dtype != "fp8_e4m3"
+    ):
+        return False
+    # The E4M3 release contract passes cold/warm quality with this cache path.
+    # Explicit AOT selection remains an override; other model routes keep their
+    # existing defaults until their own cache/quality qualification passes.
+    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    return True
+
+
 def _is_sm70_qwen38_decode_compile_contract(
     model_config: Any,
     speculative_config: Any,
@@ -404,6 +429,15 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     }
     capture_sizes.update((1, 2, max_graph_reqs))
     return sorted(capture_sizes)
+
+
+def _sm70_max_cudagraph_capture_size(
+    capture_sizes: list[int], max_num_batched_tokens: int
+) -> int:
+    # The generic sizing later drops capture sizes above max_num_batched_tokens.
+    # A cap above the largest remaining size would then read as a user setting
+    # that contradicts the capture sizes and fail config validation.
+    return max(size for size in capture_sizes if size <= max_num_batched_tokens)
 
 
 def _sm70_mtp_cudagraph_capture_sizes(
@@ -966,6 +1000,10 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    sm70_acceleration_report: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False, exclude=True
+    )
+    """Diagnostic route capabilities, excluded from the computation graph hash."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1561,6 +1599,12 @@ class VllmConfig:
             self.cache_config.cache_dtype_from_checkpoint = False
 
         self.try_verify_and_update_config()
+
+        from vllm.model_executor.models.config import sm70_dflash2_nvfp4_qualified
+
+        self.kernel_config.sm70_nvfp4.resolve(
+            qualified=sm70_dflash2_nvfp4_qualified(self)
+        )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -2162,10 +2206,13 @@ class VllmConfig:
                 and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
-                self.compilation_config.mode = CompilationMode.VLLM_COMPILE
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL_AND_PIECEWISE
-                )
+                # None means unspecified; explicit modes take precedence.
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.VLLM_COMPILE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_AND_PIECEWISE
+                    )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
                         self.scheduler_config.max_num_seqs
@@ -2225,8 +2272,11 @@ class VllmConfig:
                         cudagraph_capture_sizes
                     )
                 if self.compilation_config.max_cudagraph_capture_size is None:
-                    self.compilation_config.max_cudagraph_capture_size = max(
-                        self.compilation_config.cudagraph_capture_sizes
+                    self.compilation_config.max_cudagraph_capture_size = (
+                        _sm70_max_cudagraph_capture_size(
+                            self.compilation_config.cudagraph_capture_sizes,
+                            self.scheduler_config.max_num_batched_tokens,
+                        )
                     )
                 if self.compilation_config.use_inductor_graph_partition is None:
                     self.compilation_config.use_inductor_graph_partition = False
@@ -2270,6 +2320,12 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity; "
                         "greedy decode keeps the local-logits top1 shortcut."
                     )
+                sm70_dflash2_graph_cache = _configure_sm70_dflash2_graph_cache(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                    self.cache_config,
+                )
                 if "VLLM_USE_AOT_COMPILE" not in os.environ:
                     os.environ["VLLM_USE_AOT_COMPILE"] = "1"
                     logger.info_once(
@@ -2277,7 +2333,12 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity."
                     )
                 elif os.environ.get("VLLM_USE_AOT_COMPILE") == "0":
-                    if sm70_glm5_dflash_tp8_pp1_verifier:
+                    if sm70_dflash2_graph_cache:
+                        logger.info_once(
+                            "Using SM70 E4M3 DFlash2 compiled graph caches "
+                            "without AOT FX-graph reload; CUDA graphs remain enabled."
+                        )
+                    elif sm70_glm5_dflash_tp8_pp1_verifier:
                         logger.info_once(
                             "Using the quality-qualified regular torch.compile "
                             "path for SM70 GLM-5.3 DFlash2 TP8/PP1."
@@ -2289,27 +2350,12 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
-                if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
+                elif sm70_dflash2_graph_cache and envs.VLLM_USE_AOT_COMPILE:
                     logger.warning_once(
-                        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
-                        "leaving VLLM_DISABLE_COMPILE_CACHE unset for "
-                        "diagnostic profiling. This reuses compile artifacts "
-                        "and is not a quality-parity baseline."
-                    )
-                elif "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
-                    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-                    logger.info_once(
-                        "Auto-setting VLLM_DISABLE_COMPILE_CACHE=1 for SM70 "
-                        "Flash-V100 0.0.3 compile graph quality parity; "
-                        "decode throughput is preserved, but AOT artifact "
-                        "reload stays disabled until its token drift is fixed."
-                    )
-                elif os.environ.get("VLLM_DISABLE_COMPILE_CACHE") == "0":
-                    logger.warning_once(
-                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                        "explicit VLLM_DISABLE_COMPILE_CACHE=0 is a "
-                        "diagnostic-only configuration: cached AOT artifact "
-                        "reload reproduced deterministic greedy token drift."
+                        "Explicit VLLM_USE_AOT_COMPILE=1 selects AOT cache reload, "
+                        "which failed complete-output parity for the SM70 E4M3 "
+                        "DFlash2 release contract. Remove this override to reuse "
+                        "compiled graph caches without AOT FX-graph reload."
                     )
                 self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
@@ -2321,8 +2367,10 @@ class VllmConfig:
                 )
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
-                    "mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE, "
+                    "mode=%s, cudagraph_mode=%s, "
                     "capture_sizes=%s.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     tuple(self.compilation_config.cudagraph_capture_sizes),
                 )
             else:
@@ -2346,18 +2394,29 @@ class VllmConfig:
                     1,
                     envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE,
                 )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-                if self.compilation_config.max_cudagraph_capture_size is None:
-                    self.compilation_config.max_cudagraph_capture_size = capture_size
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.NONE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_DECODE_ONLY
+                    )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     self.compilation_config.cudagraph_capture_sizes = list(
                         range(1, capture_size + 1)
                     )
+                if self.compilation_config.max_cudagraph_capture_size is None:
+                    self.compilation_config.max_cudagraph_capture_size = (
+                        _sm70_max_cudagraph_capture_size(
+                            self.compilation_config.cudagraph_capture_sizes,
+                            self.scheduler_config.max_num_batched_tokens,
+                        )
+                    )
                 logger.info_once(
                     "Using SM70 Flash-V100 no-compile decode CUDA graph "
-                    "policy: mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, "
+                    "policy: mode=%s, cudagraph_mode=%s, "
                     "capture_size=%d.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     capture_size,
                 )
             else:
@@ -3101,6 +3160,9 @@ class VllmConfig:
 
         # complete the remaining process.
         self.compilation_config.post_init_cudagraph_sizes()
+        from vllm.sm70_profiles.acceleration import log_and_validate
+
+        log_and_validate(self)
 
     def _set_compile_ranges(self):
         """
