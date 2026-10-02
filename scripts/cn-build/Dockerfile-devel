@@ -1,0 +1,12 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list
+ENV UV_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
+ENV PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
+ENV UV_PYTHON_INSTALL_MIRROR=http://127.0.0.1:8088/pbs
+ENV UV_DOWNLOAD_URL=http://127.0.0.1:8088/uv
+ENV PROTOC_URL=http://127.0.0.1:8088/protoc/protoc-34.2-linux-x86_64.zip
+ENV DEEPEP_REPO_URL=git://127.0.0.1:9411/DeepEP.git
+COPY deps/ /opt/deps/
+ENV VLLM_CUTLASS_SRC_DIR=/opt/deps/cutlass
+ENV TRITON_KERNELS_SRC_DIR=/opt/deps/triton/python/triton_kernels/triton_kernels
+ENV VLLM_FLASH_ATTN_SRC_DIR=/opt/deps/fa-v100

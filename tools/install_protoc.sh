@@ -27,7 +27,7 @@ case "${ARCH}" in
     *) echo "Unsupported arch for protoc binary: ${ARCH}" >&2; exit 1 ;;
 esac
 
-URL="https://github.com/protocolbuffers/protobuf/releases/download/v${VERSION}/protoc-${VERSION}-linux-${URL_ARCH}.zip"
+URL="${PROTOC_URL:-https://github.com/protocolbuffers/protobuf/releases/download/v${VERSION}/protoc-${VERSION}-linux-${URL_ARCH}.zip}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 

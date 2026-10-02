@@ -181,7 +181,7 @@ do_build() {
 
 # build DeepEP
 do_build \
-    "https://github.com/deepseek-ai/DeepEP" \
+    "${DEEPEP_REPO_URL:-https://github.com/deepseek-ai/DeepEP}" \
     "DeepEP" \
     "setup.py" \
     "$DEEPEP_COMMIT_HASH" \
