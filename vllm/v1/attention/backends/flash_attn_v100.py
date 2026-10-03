@@ -24,6 +24,10 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
@@ -972,6 +976,8 @@ def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
 
 
 def _route_summary_enabled() -> bool:
+    if "VLLM_SM70_DEBUG" in os.environ:
+        return "routing" in envs.VLLM_SM70_DEBUG
     return (
         os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
         or os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
@@ -1339,8 +1345,14 @@ def _get_sm70_splitd_d256_ops():
             "sm70_d256_splitd_n32_paged_fwd",
         )
         with suppress(ImportError):
-            # Importing the interface loads the bundled FA2 torch library.
-            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+            # The FA2 library loads on first use, one per process and chosen
+            # for the worker's device; make sure it is there before the
+            # operators are resolved.
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
+
+            ensure_fa2_library_loaded()
 
         namespace = getattr(torch.ops, "_vllm_fa2_C", None)
         if namespace is None or not all(
@@ -3605,7 +3617,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+            sm70_dflash2_enabled(
+                "fused_smallq_metadata", capture_sm70_dflash2_config(self.vllm_config)
+            )
             and self.device.type == "cuda"
             and current_platform.is_device_capability(70)
             and use_dflash
@@ -4701,8 +4715,22 @@ def prepare_dflash2_smallq_group_metadata(
         )
 
     if (
-        not envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
-        or not envs.VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA
+        not sm70_dflash2_enabled(
+            "fused_smallq_metadata",
+            capture_sm70_dflash2_config(
+                getattr(builders_by_group[0][1], "vllm_config", None)
+            )
+            if builders_by_group
+            else None,
+        )
+        or not sm70_dflash2_enabled(
+            "grouped_smallq_metadata",
+            capture_sm70_dflash2_config(
+                getattr(builders_by_group[0][1], "vllm_config", None)
+            )
+            if builders_by_group
+            else None,
+        )
         or not builders_by_group
         or num_reqs <= 0
         or num_query_tokens <= 1

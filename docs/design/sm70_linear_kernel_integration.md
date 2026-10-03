@@ -16,6 +16,34 @@ DFlash2 pipelines and collectives remain separate migration scopes.
 
 ## Configuration and qualification
 
+### Turing ModelOpt linears
+
+On SM75, the common selectors can choose `TuringQpn2NvFp4LinearKernel`
+for checkpoint-native NVFP4 and `TuringQpn8Fp8LinearKernel` for static
+per-tensor E4M3 weights. Both keep activations and output in FP16 and require
+the corresponding native QPN operators. NVFP4 accepts positive output widths
+with zero padding to a 32-column tile and K divisible by 128; FP8 requires
+positive N divisible by 32 and K divisible by 128. These contracts do not
+depend on model names, tensor parallel size or speculative width.
+
+The paths are selected by default when supported. `sm70_nvfp4.dense_qpn2`
+and `sm70_fp8.enabled` can disable their respective routes through
+`--kernel-config`; `VLLM_DISABLED_KERNELS` can disable an individual class.
+The `turbomind` provider includes these registry-independent QPN kernels.
+Legacy backend disable overrides remain compatible. The new NVFP4 policy
+participates in compilation identity, invalidating older cached graphs.
+
+NVFP4 retains one QPN2 layout: rows up to 32 use native decode, and larger
+batches dequantize into invocation-owned FP16 storage for dense GEMM. FP8
+uses the native QPN8 dispatcher with invocation-owned dense scratch. Runtime
+dispatch happens inside opaque operations, and cached graphs retain no
+serialized workspace address. Volta retains its existing implementations.
+
+This support concerns linear weights. It does not establish FP8 KV-cache or
+attention-backend support on Turing. A conservative serving configuration
+uses `--dtype float16 --kv-cache-dtype float16` with an attention backend
+supported by the installed build, such as `TRITON_ATTN`.
+
 `KernelConfig.sm70_nvfp4` resolves once before layers load. Runtime QPN2
 execution consumes those resolved values; it does not re-read environment
 variables. This state participates in `KernelConfig.compute_hash` and is
@@ -115,6 +143,48 @@ changed row IDs, and supplies quality and speed evidence for those rows.
 Unexpected additions and missing intended changes both fail. The retained
 snapshot must be generated from the independent baseline before changing
 implementation or expected rows.
+
+## AWQ dense linear migration
+
+`TurboMindAwqLinearKernel` uses the existing `MPLinearKernel` lifecycle and
+CUDA priority list. The AWQ loader retains checkpoint loading and its
+architecture-specific fallback; preparation, bounded exact-dense scratch and
+execution belong to the kernel. The legacy AWQ GEMM packing differs from the
+GPTQ packing accepted by other MP kernels, so the selector filters that layout
+family before applying provider priority. Native arithmetic is unchanged.
+
+`KernelConfig.sm70_awq` resolves the dense controls once. The three legacy names
+remain compatible for one release:
+
+| Legacy name | Configuration field |
+| --- | --- |
+| `VLLM_SM70_AWQ_TURBOMIND` | `sm70_awq.enabled` |
+| `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE` | `sm70_awq.prefill_exact_dense` |
+| `VLLM_SM70_AWQ_MLP_ENGINE` | `sm70_awq.fused_silu` |
+
+The shared TurboMind switch still controls unmigrated AWQ MoE. The dense
+compatibility warning states that scope. Format admission and legacy Marlin
+conversion remain in the quantization config. `VLLM_DISABLED_KERNELS` can
+disable `TurboMindAwqLinearKernel`, selecting the retained Triton fallback.
+Missing native preparation and unsupported group sizes retain fail-closed
+behavior. The default exact-dense role boundary is recorded in model policy;
+the fused epilogue remains experimental with its existing TP2/M1 limit.
+Neither qualification is broadened without an AWQ quality pair.
+
+Unused AWQ policy is excluded from the graph fingerprint. Actual AWQ policy is
+resolved before compilation and included in the fingerprint. An independent
+pre-migration hash fixture protects NVFP4 from changes to an unused format.
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m tools.sm70_route_snapshot \
+  --category awq --baseline-ref PARENT_SHA
+```
+
+The AWQ category executes the independent legacy loader and candidate loader,
+recording preparation and native decode/prefill arguments. It covers the same
+324 model/KV/TP/speculation/concurrency/budget scopes and ten boundary cases.
+NVFP4 models are explicitly inapplicable to this format; these doubles do not
+replace native arithmetic or whole-model AWQ validation.
 
 ## Adding another optimization
 

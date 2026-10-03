@@ -54,6 +54,10 @@ from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
+    Sm70AwqLinearLayerConfig,
+    TurboMindAwqLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -118,6 +122,11 @@ from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
     Sm70NvFp4LinearLayerConfig,
     TurboMindNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+    TuringNvFp4LinearLayerConfig,
+    TuringQpn2NvFp4LinearKernel,
+    TuringQpn8Fp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -159,6 +168,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    Sm70Fp8LinearLayerConfig,
+    TurboMindFp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     TritonFp8BlockScaledMMKernel,
     TritonInt8ScaledMMLinearKernel,
@@ -188,6 +201,10 @@ def _get_linear_backend() -> str:
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
+        TuringQpn2NvFp4LinearKernel,
+        TuringQpn8Fp8LinearKernel,
+        TurboMindAwqLinearKernel,
+        TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
         TurboMindNvFp4LinearKernel,
@@ -279,6 +296,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TuringQpn8Fp8LinearKernel,
         MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -308,6 +326,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        TurboMindFp8LinearKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
@@ -344,6 +363,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TurboMindAwqLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
         AllSparkLinearKernel,
@@ -386,6 +406,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TuringQpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
         Qpn2NvFp4LinearKernel,
         TurboMindNvFp4LinearKernel,
@@ -428,6 +449,10 @@ _KernelConfigT = TypeVar(
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
+    if isinstance(config, Sm70Fp8LinearLayerConfig) and not issubclass(
+        kernel, TurboMindFp8LinearKernel
+    ):
+        return False, f"{kernel.__name__} does not consume the SM70 W8A16 layout"
     if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
         return False, f" {kernel.__name__} is disabled by environment variable"
 
@@ -453,6 +478,48 @@ def is_supported_and_can_implement_kernel(
         )
 
     return True, ""
+
+
+def _record_kernel_selection(config, candidates, selected, failures) -> None:
+    """Keep actual selector results on this engine, without probing extra kernels."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        return
+    shape = getattr(config, "weight_shape", None)
+    if shape is None:
+        shape = getattr(config, "partition_weight_shape", None)
+    family = type(config).__name__
+    key = (
+        f"{family}:{shape}:{selected.__name__ if selected else 'fallback'}:"
+        f"{tuple(failures)}"
+    )
+    rows = getattr(cfg.kernel_config, "linear_kernel_selections", None)
+    if rows is None:
+        return
+    if key in rows:
+        rows[key]["layers"] += 1
+        return
+    selected_name = selected.__name__ if selected is not None else None
+    paths = {}
+    for kernel in candidates:
+        name = kernel.__name__
+        reason = next((reason for reason in failures if name in reason), None)
+        paths[name] = {
+            "enabled": name == selected_name,
+            "reason": None if name == selected_name else reason or "lower_priority",
+        }
+    if selected_name and selected_name not in paths:
+        paths[selected_name] = {"enabled": True, "reason": None}
+    rows[key] = {
+        "family": family,
+        "local_weight_shape": list(shape) if shape is not None else None,
+        "selected": selected_name,
+        "paths": paths,
+        "layers": 1,
+        "scope": "loaded_layer_selection",
+    }
 
 
 def choose_scaled_mm_linear_kernel(
@@ -485,13 +552,14 @@ def choose_scaled_mm_linear_kernel(
         _KernelT: Chosen kernel.
     """
 
-    failure_reason_list = []
+    failure_reason_list: list[str] = []
 
     if force_kernel is not None:
         can_implement, failure_reason = is_supported_and_can_implement_kernel(
             force_kernel, config, compute_capability
         )
         if can_implement:
+            _record_kernel_selection(config, [force_kernel], force_kernel, [])
             return force_kernel
 
         logger.info_once(
@@ -518,12 +586,51 @@ def choose_scaled_mm_linear_kernel(
             is_supported_and_can_implement_kernel(kernel, config, compute_capability)
         )
         if is_supported_and_can_implement:
+            _record_kernel_selection(
+                config, platform_kernels, kernel, failure_reason_list
+            )
             return kernel
         failure_reason_list.append(failure_reason)
 
+    _record_kernel_selection(config, platform_kernels, None, failure_reason_list)
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "ScaledMM linear layer. Reasons: \n" + "\n".join(failure_reason_list)
+    )
+
+
+def init_sm70_fp8_linear_kernel(
+    activation_quant_key: QuantKey,
+    weight_quant_key: QuantKey,
+    input_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    weight_shape: tuple[int, int],
+    is_scale_e8m0: bool,
+) -> TurboMindFp8LinearKernel:
+    from vllm.config import get_current_vllm_config
+
+    config = Sm70Fp8LinearLayerConfig(
+        weight_quant_key=weight_quant_key,
+        activation_quant_key=activation_quant_key,
+        input_dtype=input_dtype,
+        out_dtype=out_dtype,
+        weight_shape=weight_shape,
+        is_scale_e8m0=is_scale_e8m0,
+        policy=get_current_vllm_config().kernel_config.sm70_fp8,
+    )
+    kernel_type = choose_scaled_mm_linear_kernel(
+        config=config,
+        possible_kernels=_POSSIBLE_FP8_BLOCK_KERNELS,
+    )
+    assert issubclass(kernel_type, TurboMindFp8LinearKernel)
+    return kernel_type(
+        config,
+        layer_param_names=[
+            "weight",
+            "weight_scale_inv",
+            "input_scale",
+            "input_scale_ub",
+        ],
     )
 
 
@@ -666,6 +773,15 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
 
+    if isinstance(config, Sm70AwqLinearLayerConfig):
+        # Other MP kernels accept GPTQ packing, not the legacy AWQ GEMM
+        # checkpoint packing. The format adapter retains its Triton fallback.
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindAwqLinearKernel)
+        ]
+
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
     if linear_backend != "auto":
@@ -698,12 +814,14 @@ def choose_mp_linear_kernel(
         can_implement, failure_reason = kernel.can_implement(config)
         if can_implement:
             logger.info_once("Using %s for mixed-precision linear", kernel.__name__)
+            _record_kernel_selection(config, platform_kernels, kernel, failure_reasons)
             return kernel
         else:
             failure_reasons.append(
                 f" {kernel.__name__} cannot implement due to: {failure_reason}"
             )
 
+    _record_kernel_selection(config, platform_kernels, None, failure_reasons)
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "WNA16 linear layer. Reasons: \n" + "\n".join(failure_reasons)
@@ -905,6 +1023,16 @@ def init_nvfp4_linear_kernel(
 
     if isinstance(config, Sm70NvFp4LinearLayerConfig):
         kernel, decisions = select_sm70_nvfp4_linear_kernel(config, skip_qpn4=skip_qpn4)
+        _record_kernel_selection(
+            config,
+            [
+                k
+                for k in _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]
+                if issubclass(k, TurboMindNvFp4LinearKernel)
+            ],
+            kernel,
+            [f"{name}: {reason}" for name, reason in decisions.items() if reason],
+        )
         if kernel is None:
             raise ValueError(f"No SM70 NVFP4 weight-only kernel available: {decisions}")
         logger.info_once("Using %s for SM70 NVFP4 GEMM", kernel.__name__)
@@ -1016,8 +1144,12 @@ def init_nvfp4_linear_kernel(
             )
 
         logger.info_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
+        if isinstance(config, TuringNvFp4LinearLayerConfig):
+            _record_kernel_selection(config, possible, kernel_cls, failure_reasons)
         return kernel_cls(config)
 
+    if isinstance(config, TuringNvFp4LinearLayerConfig):
+        _record_kernel_selection(config, possible, None, failure_reasons)
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "NVFP4 linear layer. Reasons: \n" + "\n".join(failure_reasons)
