@@ -51,7 +51,7 @@ TRITON_TAG="v3.5.1"
 FA_V100_COMMIT="c2eda5e6115b98c3ba4bfd181570668742eece22"
 DEEPEP_COMMIT="73b6ea4"
 LMM_COMMIT="5b558989844d1c7af3e43d0f604069ffd9c06320"
-PBS_TAG="20260929"   # python-build-standalone release tag
+PBS_TAG="20261001"   # python-build-standalone release tag
 
 log()  { echo -e "\033[32m[build-cn]\033[0m $*"; }
 warn() { echo -e "\033[33m[build-cn] WARN:\033[0m $*" >&2; }
@@ -71,7 +71,7 @@ ensure_http_mirror_files() {
   [ -f "$MIRROR_DIR/uv/uv-x86_64-unknown-linux-gnu.tar.gz" ] || need=1
   # python-build-standalone（uv 托管 Python，stripped 变体）
   local py
-  for py in "3.10.21" "3.11.16" "3.12.14" "3.13.15" "3.14.7"; do
+  for py in "3.10.22" "3.11.17" "3.12.15" "3.13.16" "3.14.8"; do
     [ -f "$MIRROR_DIR/pbs/$PBS_TAG/cpython-${py}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" ] || need=1
   done
   # protoc / sccache / flashinfer wheel
@@ -86,7 +86,7 @@ ensure_http_mirror_files() {
   curl -sL -m 600 -o "$MIRROR_DIR/uv/uv-x86_64-unknown-linux-gnu.tar.gz" \
     "$(gh https://github.com/astral-sh/uv/releases/download/${uv_ver}/uv-x86_64-unknown-linux-gnu.tar.gz)"
   local py
-  for py in "3.10.21" "3.11.16" "3.12.14" "3.13.15" "3.14.7"; do
+  for py in "3.10.22" "3.11.17" "3.12.15" "3.13.16" "3.14.8"; do
     curl -sL -m 600 -o "$MIRROR_DIR/pbs/$PBS_TAG/cpython-${py}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" \
       "$(gh https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${py}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz)"
   done
@@ -206,7 +206,10 @@ ensure_base_images() {
   catalog=$(curl -s -m 5 "http://127.0.0.1:$REGISTRY_PORT/v2/_catalog" | tr -d '{}"' | tr ',' '\n' | tr -d ' ')
   local img
   for img in "devel:local/cuda-devel-cn:$CUDA_VERSION" "base:local/cuda-base-cn:$CUDA_VERSION"; do
-    local kind="${img%%:*}" name="${img#*:}" reg_name="localhost:$REGISTRY_PORT/${name#local/}"
+    local kind name reg_name
+    kind="${img%%:*}"
+    name="${img#*:}"
+    reg_name="localhost:$REGISTRY_PORT/${name#local/}"
     if docker image inspect "$name" >/dev/null 2>&1; then
       log "基础镜像 $name 已存在"
     else
