@@ -91,6 +91,9 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
                 capability = getattr(kernel, "capability", None)
                 if capability is not None and is_dataclass(capability):
                     row["operator_admission"] = asdict(capability)
+                capabilities = getattr(kernel, "operator_capabilities", ())
+                if capabilities:
+                    row["operator_candidates"] = [asdict(c) for c in capabilities]
     return result
 
 
@@ -284,6 +287,9 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
 
     # isort: split
     # Keep the companion import stable with and without extracted build files.
+    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+    # isort: split
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
@@ -307,6 +313,9 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
         "page_supported": long_attention_page_supported(page_size, BUILTIN_MANIFEST),
         "scalar": scalar_tail_attention_available(),
         "q8000": _get_sm70_d256_gqa_architecture_q8192_op() is not None,
+        "bm32_aligned_pages": (
+            getattr(flash_attn_v100_cuda, "paged_prefill_bm32_page_alignment", 0) == 16
+        ),
     }
 
 
@@ -348,6 +357,36 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
     return "contract_mismatch:dflash2_verifier=False≠True"
 
 
+def _bm32_paged_prefill_report(cfg, native: Mapping[str, bool]) -> dict[str, Any]:
+    import torch
+
+    page = int(cfg.cache_config.block_size or 0)
+    head_dim = getattr(cfg.model_config.hf_text_config, "head_dim", None)
+    reason = (
+        "kv_dtype"
+        if cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.model_config.dtype != torch.float16
+        else "head_dim"
+        if head_dim != 256
+        else "page_alignment"
+        if page < 16 or page % 16
+        else "user_override"
+        if not envs.VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM
+        or not envs.VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE
+        else "operator_missing:aligned_bm32_paged_prefill"
+        if not native.get("bm32_aligned_pages", False)
+        else None
+    )
+    return _row(
+        reason,
+        scope="configured_native_capability",
+        block_size=page,
+        head_dim=head_dim,
+        runtime_guards="Flash-V100; at least 32 query rows; no sparse mask, "
+        "sliding window or anchored window",
+    )
+
+
 def build_report(cfg: VllmConfig) -> dict[str, Any]:
     if cfg.model_config is None:
         # PLE/component processes create a config without a target model.
@@ -386,10 +425,16 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
+    report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections
     report["ple_disk_cascade"] = {
         "enabled": cfg.kernel_config.ple_disk_cascade_active,
         "reason": cfg.kernel_config.ple_disk_cascade_reason,
         "scope": "configuration_capability",
+    }
+    report["qsa_auto_e4m3"] = {
+        "enabled": cfg.kernel_config.qsa_auto_e4m3_active,
+        "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
+        "scope": "calibrated_cache_storage",
     }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
@@ -431,6 +476,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "q8000_prefill",
             "compile_graph",
             "compile_cache",
+            "bm32_paged_prefill",
         }
         paths.update({name: _row("not_applicable") for name in sorted(names)})
         return report
@@ -514,6 +560,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         )
         report["operator_probe_error"] = type(exc).__name__ + ": " + str(exc)
     dtype = cfg.cache_config.cache_dtype
+    paths["bm32_paged_prefill"] = _bm32_paged_prefill_report(cfg, native)
     grouped_reason = (
         "kv_dtype"
         if dtype != "fp8_e4m3"
