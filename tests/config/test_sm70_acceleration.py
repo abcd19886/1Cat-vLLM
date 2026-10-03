@@ -15,6 +15,10 @@ from vllm.sm70_profiles import acceleration as acc
 @pytest.fixture
 def config(monkeypatch):
     envs.disable_envs_cache()
+    # Other operator tests may monkeypatch a dynamic env attribute. Remove
+    # their restored concrete values so this fixture exercises actual getters.
+    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
+        monkeypatch.delitem(vars(envs), name, raising=False)
     for name, value in {
         **_SM70_BATCH_GEMM_DEFAULTS,
         **_SM70_DFLASH2_VERIFIER_DEFAULTS,
@@ -315,3 +319,16 @@ def test_unqualified_linear_default_reports_reason(config):
     assert row["default_qualification_reason"] == (
         "draft_selector_state_contract_not_quality_qualified"
     )
+
+
+@pytest.mark.parametrize("format_name", ("sm70_awq", "sm70_fp8"))
+def test_quantized_models_report_their_policy_without_claiming_nvfp4_profile(
+    config, format_name
+):
+    policy = getattr(config.kernel_config, format_name)
+    policy.resolve()
+    config.speculative_config = None
+    report = acc.log_and_validate(config)
+    assert report["profile"] is None
+    assert report["expected_acceleration"] == []
+    assert report["linear_kernel_policies"][format_name]["configuration"]["resolved"]

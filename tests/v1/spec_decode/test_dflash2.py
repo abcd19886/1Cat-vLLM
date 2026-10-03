@@ -18,6 +18,7 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
+from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS, Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     _get_dflash2_checkpoint_draft_tokens,
@@ -25,7 +26,6 @@ from vllm.config.speculative import (
 from vllm.config.vllm import (
     _SM70_DFLASH2_VERIFIER_DEFAULTS,
     _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS,
-    _apply_sm70_dflash2_verifier_defaults,
     _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path,
     _configure_sm70_glm5_dflash_tp4_push_allreduce,
     _configure_sm70_glm5_dflash_tp8_pp1_verifier_path,
@@ -288,20 +288,21 @@ def test_sm70_dflash2_verifier_defaults_preserve_overrides(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(overridden_name, "0")
 
-    applied = _apply_sm70_dflash2_verifier_defaults()
-
-    assert overridden_name not in applied
-    assert os.environ[overridden_name] == "0"
+    before = dict(os.environ)
+    policy = Sm70DFlash2Config()
+    policy.resolve(qualified=True)
+    assert dict(os.environ) == before
+    assert not getattr(policy, SM70_DFLASH2_LEGACY_FIELDS[overridden_name])
     for name, expected_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
         if name != overridden_name:
-            assert name in applied
-            assert os.environ[name] == expected_value
+            assert getattr(policy, SM70_DFLASH2_LEGACY_FIELDS[name]) == bool(
+                int(expected_value)
+            )
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
         "VLLM_SM70_DFLASH2_QPN8_RERANK",
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
         "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
@@ -916,7 +917,7 @@ def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        dflash2_model.envs,
+        envs,
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
         True,
     )
@@ -961,7 +962,7 @@ def test_sharded_context_projection_falls_back_outside_exact_contract(
     )
     sentinel = object()
     monkeypatch.setattr(
-        dflash2_model.envs,
+        envs,
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
         enabled,
     )
@@ -1717,21 +1718,11 @@ def test_qpn8_rerank_restores_dense_vocab_tie_order():
     assert torch.equal(actual_ids, expected_ids + vocab_start)
 
 
-def test_qpn8_candidate_order_requires_explicit_experimental_opt_in(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", False)
-    monkeypatch.setattr(
-        envs,
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
-        False,
-    )
+def test_qpn8_candidate_order_is_retired(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "0")
+    # Stale benchmark launch files cannot re-enable the failed experiment.
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "1")
     assert _sm70_dflash2_use_dense_order()
-
-    monkeypatch.setattr(
-        envs,
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
-        True,
-    )
-    assert not _sm70_dflash2_use_dense_order()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -52,7 +52,7 @@ repos:
         -c, requirements/cuda.txt,
         -o, requirements/test/cuda.txt,
         --index-strategy, unsafe-best-match,
-        --torch-backend, cu130,
+        --torch-backend, cu128,
         --python-platform, x86_64-manylinux_2_28,
         --python-version, "3.12",
       ]
@@ -244,21 +244,34 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
-  # prevent new VLLM_* reads that bypass vllm/envs.py (compile cache key)
+  # Keep Python and native environment reads in the compile cache key.
   - id: check-env-registration
     name: "Prevent unregistered 'VLLM_*' environment reads"
     entry: python tools/pre_commit/check_env_registration.py
     language: python
-    types: [python]
-    files: ^vllm/
+    types: [file]
+    files: ^(vllm/.*\.py|(?:csrc|flash-attention-v100|flash_qla|lmdeploy)/.*\.(?:c|cc|cpp|cu|cuh|h|hpp))$
     additional_dependencies: [regex]
+  - id: check-env-metadata
+    name: Require complete environment registration metadata
+    entry: python tools/pre_commit/check_env_metadata.py
+    language: python
+    pass_filenames: false
+    always_run: true
+  - id: env-reference
+    name: Check generated environment reference
+    entry: python -m tools.generate_env_reference --check
+    language: python
+    pass_filenames: false
+    additional_dependencies: [regex]
+    files: ^(vllm/envs.*\.py|tools/generate_env_reference\.py|tools/pre_commit/check_env_metadata\.py|docs/configuration/env_var_reference\.md)$
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
     language: python
     additional_dependencies: [regex]
   - id: check-sm70-linear-policy
-    name: Keep migrated SM70 linear policy in configuration
+    name: Keep migrated SM70 policy in configuration
     entry: python tools/pre_commit/check_sm70_linear_policy.py
     language: python
     pass_filenames: false

@@ -48807,3 +48807,193 @@ The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
 qualified; do not repeat it as accepted current performance. #703 has stronger
 same-contract quality evidence and is the next default-promotion candidate
 to screen, with resident-weight memory and KV capacity checked explicitly.
+
+### AWQ dense kernel framework migration (2026-10-03)
+
+The AWQ adapter now selects `TurboMindAwqLinearKernel` through the existing
+mixed-precision registry. Preparation, exact-dense workspace and execution
+move to the kernel with unchanged native calls. Dense policy resolves in
+`KernelConfig.sm70_awq`; three legacy switches remain compatible. AWQ MoE,
+FP8/QPN8, attention and verifier policies remain separate scopes.
+
+The independent legacy/candidate CPU snapshot covers 324 configurations and
+10 boundaries with zero default route changes. Twenty real AWQ eager cases
+(K/N representative of dense projections, groups 32/64/128 and M=1/4/8/4096/
+8192) plus three graph replays at each M=8 case match bitwise. No native
+arithmetic or accumulation precision is changed.
+
+Matched ordinary-wheel 27B release-profile32K validation used V1000-3,
+TP4, E4M3, DFlash7, page2048, budget8192, maximum4 sequences and FULL/
+PIECEWISE graphs. Initial C1 pure-decode median was 133.30 ->131.38 tokens/s,
+with identical returned tokens and TTFT 8.921 ->8.933s. The first two C4
+sampling pairs showed opposite changes (263.35 ->244.52 and, with ordered
+admission, 247.93 ->254.65); neither was a stable trajectory comparison.
+Deterministic target sampling still diverged at long context before the hash
+fix, and measured259.61 ->234.86. Preserve these failed controls.
+
+A new, unused AWQ subconfig had salted NVFP4's graph fingerprint. Resolve and
+hash AWQ only when it is used; an independent pre-migration hash fixture now
+protects that boundary. With the original fingerprint restored, all12 C4
+request token sequences match the deterministic control. Pure-decode C4 is
+259.61 ->254.68 tokens/s (-1.90%, inside the baseline's two-repeat spread of
+252.64..266.59). This is refactor validation, not a speedup claim. The change
+in long-context trajectory associated with the unused fingerprint is measured;
+its exact compiler/warmup numerical mechanism is not localized.
+
+Paired natural-stop quality checks have identical tokens in all21 requests:
+MBPP subset11/12, 32K needle3/3 and Chinese QA5/6 in both arms, with no new
+failure. The existing lowercase/underscore and machine-rate failures are
+retained. Dataset SHA256 remains the #764 sanitized-MBPP manifest.
+
+Measured source pair starts at b5f36b66434531cf888f463696f9769fb3520c69;
+normal wheels carry identical hashes for12 bundled vllm native libraries.
+Artifacts are retained in the task's sm70-awq-routing-20261002 audit directory,
+including failed starts, samplings, fixed-order controls, hash ablation,
+full returned tokens and checkpoint/input/output digests. These tests do not
+establish a new35B speed baseline or qualify new AWQ projection roles. AWQ
+exact-dense role expansion and the fused epilogue's TP boundary await a real
+AWQ quality pair; the available27B NVFP4 model cannot qualify those changes.
+
+## 2026-09-26 MTP4 trace and historical-verifier timing reconciliation
+
+- Retain the accepted 27.3963-ms full-round baseline. Same 8192/129 request,
+  one engine, capture off/on/off: **27.1598 / 35.4506 / 28.0762 ms/round**.
+  All 129 output tokens, 85 rounds and 43 accepted drafts match the original
+  trace. Node capture adds 7.3743-8.2908 ms against the two off arms; do not
+  assume all of the older unmatched 9.1424-ms difference is precisely attributed.
+- Existing V2 phase timer, separate process without Nsight: target verifier
+  wall **21.9472-22.2415 ms** across rank means at 8K. TP0 forward/sample/state
+  event intervals are 21.1253/0.7477/0.0164 ms. Same historical 152-token
+  HumanEval/0 input gives 21.5247-21.8349-ms target wall and exactly the old
+  62 output tokens/acceptance counters. Old #398 23.409 ms includes sampling
+  and state, and differs in batch/memory settings; it is not a node-service sum.
+- Original target-only graph: 23.6025-ms kernel sum minus 2.2471-ms overlap
+  plus 7.9613-ms no-kernel time equals 29.3167-ms wall. Dense target service is
+  9.3119 ms; the older 12.8330-ms table describes the entire round. Direct
+  M5 experts/push remain active. Ordinary M5 dense replacements were already
+  screened at only 0.1902-ms projected savings; preserve those rejected paths.
+- Measurement source `3ed85627c8` matches the frozen baseline runtime except
+  for the typing-only overload. This documentation update is not a GPU
+  qualification of later main changes. No source kernel/default change or wheel.
+- Retain both harness failures: initial configuration serialization after
+  warmup, and callable-RPC rejection after the successful off/on/off segment.
+  The separate named-worker phase probe completes with exit 0. No insecure
+  serialization override, repeated node capture or broad quality rerun.
+- Full scope, per-rank values and limitations:
+  [MTP4 timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
+
+### AWQ final main-synced validation (2026-10-03)
+
+Against main `f350e2ebe7`, the source-complete installed-wheel comparison passed
+on four V100 32 GB GPUs with Torch 2.10.0+cu128 and CUDA 12.8. The 27B NVFP4
+DFlash2 release profile retained TP4, FP16 activations, E4M3 KV, page2048,
+8192-token budget, four sequences, seven speculative tokens, and its existing
+attention/graph modes. The latency workload used 32K input and a 256-token
+output limit, temperature1, top-p0.95, top-k20, seed4201+j.
+
+After excluding the first warmup sample, pure C1 decode was130.63→132.47 tokens/s
+and C4 was258.93→264.89 tokens/s; C1 TTFT was8.937→8.939 seconds. No slowdown
+was observed and no acceleration gain is claimed for this structural change.
+C1 matched all four token sequences. C4 matched three of twelve sequences with
+probabilistic drafting and concurrent admission; these latency requests are not
+reported as a deterministic numerical oracle.
+
+All21 deterministic paired quality sequences were identical and ended
+naturally: MBPP11/12,32K needle3/3,ChineseQA5/6 in both arms, with no new failures.
+The final installed-wheel AWQ oracle also passed: all 20 shape/group cases and
+CUDA Graph replays were bitwise identical. The earlier result is retained with
+its original source boundary.
+
+CI passed after adding explicit types to two imported ROCm router buffers.
+That annotation-only change preserves executable bytecode and constants. No
+AWQ qualification limit, native numerical code, or calculation precision changes.
+
+### Serialized FP8 kernel integration gate (2026-10-03, #794)
+
+Control source `1fa49b3645`, candidate `333217c91a`; normal installed wheels
+contain identical hashes for all 15 native shared objects. The actual historical
+FP8 loader dispatch snapshot matches all 324 standard configurations and 226
+additional FP8 configurations/edges. Eleven Python aliases resolve into
+`KernelConfig.sm70_fp8`; two flags shared with native host dispatch retain their
+legacy interface. Duplicate PP2/TP4 quality predicates have one definition in
+`models/config.py`; no admission boundary is widened.
+
+The numerical oracle covers four FP8 geometries, M1/4/8/4096/8192, TurboMind and
+QPN8: all 40 cases match checkpoint, packed-weight, scale and output hashes.
+Fused gate/up outputs and three CUDA Graph replays at M8 also match bitwise.
+This is an operator oracle, not a 35B model speed baseline.
+
+The 27B NVFP4 DFlash2 release-profile gate uses four V100 32 GB GPUs, Torch
+2.10.0+cu128, CUDA 12.8, TP4, FP16 compute, E4M3 KV, page2048, budget8192,
+C4 capacity, memory utilization0.8, max length262144, 32K input and a 256-token
+output limit. Target sampling remains temperature1/top-p0.95/top-k20 with
+probabilistic drafting. Pure C1 decode is132.08→130.34 tokens/s (-1.32%);
+C4 is252.17→255.23 (+1.21%); C1 TTFT is8.949→8.952s. Individual C1 samples
+span more than the median shift. Retain the raw observations; no speedup claim.
+All21 deterministic quality outputs match tokens and natural EOS, with unchanged
+MBPP11/12, needle3/3 and ChineseQA5/6; the same two baseline failures remain.
+
+The mandatory CPU gate passes54 common tests plus64 scoped tests, and CI passes.
+Two NVFP4 padded-output warmup tests fail under forced CpuPlatform identically
+on the unmodified control; retain that negative result outside this FP8 scope.
+Config environment writes remain20 including one `setdefault`, down from22
+before #790; assignment-only counts are19 and21. All1003 registrations have
+metadata. No environment name is deleted during this compatibility version.
+Actual 35B-A3B AWQ/FP8 checkpoints remain required before widening qualification
+or claiming same-criterion 35B decode parity.
+
+### Loaded SM70 route reporting (2026-10-03)
+
+- Record decisions and actual rejection reasons in the existing linear selectors;
+  do not probe lower-priority kernels just to populate a report. KernelConfig
+  owns the data per engine and excludes it from the compilation hash.
+- Collect worker tables once after initialization. Startup and acceleration HTTP
+  diagnostics read the same table, including final NVFP4/AWQ/FP8 instances,
+  preparation flags and resident packed-buffer bytes. Never claim request hits.
+- Discover SM70 policy configuration fields automatically; unrelated AWQ/FP8
+  models no longer claim the fixed 27B NVFP4 release profile. Legacy non-linear
+  rows remain until their category migrations.
+- This is route-preserving instrumentation. Environment counts, model/TP
+  qualifications and the 20 configuration environment writes do not change.
+
+### SM70 environment surface cleanup (2026-10-03)
+
+- Remove six inactive registrations with no runtime/native consumer; add the
+  unified debug entry and register long attention's stable opt-out. Net change
+  is four fewer registered variables (1003 -> 999), not hundreds deleted.
+- Curate 36 public SM70 controls. Keep internal tuning, compatibility and
+  diagnostic metadata in the developer inventory; this does not remove the
+  remaining implementation switches. Public descriptions explain behavior,
+  defaults and override use, and CI rejects consumer placeholder text there.
+- Move four QSA defaults into `SM70_QSA_TUNING`, preserving all explicit legacy
+  values/parsing with warnings for one full released compatibility version.
+  Consolidate six observer aliases into `VLLM_SM70_DEBUG` channels.
+- NVFP4/AWQ/FP8 historical dispatch matrices have zero route changes. Repair
+  the FP8 snapshot loader so it loads the historical kernel after #794 instead
+  of assuming the helpers still live in fp8.py. The 43 QSA function/kernel ASTs
+  are identical; only the unchanged tuning assignments move into a table.
+- Configuration environment writes remain 20; model/TP locks are unchanged in
+  this pure cleanup. Default promotions and MTP admission belong to the
+  separately validated Flash-Next PR. No GPU speed A/B is needed here.
+
+### DFlash2 verifier policy migration (#807)
+
+Per-engine `SpeculativeConfig.sm70_dflash2` replaces the verifier startup ENV
+write and captures decisions through loaded operators and graph capture.
+Retain model quality qualification and parser compatibility. Standard 324 routes
+remain equal; the explicit TP2 combined-copy local-layout edge is the sole
+intentional change. See [design](sm70_dflash2_policy.md) and the checked expected
+change list. Six GPU bitwise/graph oracle cases passed; combined-copy graph replay was
+6.233 versus 6.824 microseconds median. Do not count this
+as a 35B AWQ/FP8 speed baseline. Environment registrations remain 999; public
+SM70 controls 36→31; unchecked reads 0; startup ENV write sites 20→19.
+
+### Retire DFlash2 candidate-order research override
+
+Remove the failed candidate-order environment registration and both typed
+ordering choices. Keep dense ordering mandatory; its old alias is warning-only
+for one released cycle. Historical quality evidence is recorded in the
+[retirement design](sm70_dflash2_retired_candidate_order.md). Standard 324 routes
+remain equal; one explicit failed-experiment edge intentionally changes.
+Registrations 999→998; public SM70 controls remain 31; unchecked reads 0;
+startup ENV write sites remain 19. Native numerical functions stay unchanged.
