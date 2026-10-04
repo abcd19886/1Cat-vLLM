@@ -413,7 +413,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_dequant_sm70.cu")
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_dequant_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_decode_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
@@ -731,7 +732,8 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
     "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
-    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu")
+    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu"
+    "csrc/sm70_turbomind/ops/sm70_sampler_graph_branch.cu")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}"
     CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
@@ -751,6 +753,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+    set_target_properties(_sm70_sampler_C PROPERTIES
+      CUDA_ARCHITECTURES 70
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
   target_compile_definitions(_sm70_sampler_C PRIVATE
     TORCH_API_INCLUDE_EXTENSION_H
     $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF_OPERATORS__>
@@ -761,7 +769,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     $<$<COMPILE_LANGUAGE:CXX>:-UNDEBUG>
     $<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG;-lineinfo>)
   target_link_libraries(_sm70_sampler_C PRIVATE
-    "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
+    "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so" CUDA::cuda_driver)
 
   # Native H3 kernels use ordinary Torch/Python ABI and remain independent of
   # the existing primary SM70 extension's registrations.

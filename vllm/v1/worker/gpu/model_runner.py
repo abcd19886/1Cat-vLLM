@@ -159,6 +159,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         set_default_max_concurrency(vllm_config.max_concurrent_batches)
 
         self.device = device
+        from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
+
+        self.mixed_prefill_timer = MixedPrefillTimer()
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -1315,6 +1318,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sample_hidden_states,
                 input_batch,
                 grammar_output,
+                allow_graph=self.lora_config is None,
             )
             if isinstance(sparse_result, DFlash2LogitsFallback):
                 cached_logits = sparse_result
@@ -1492,6 +1496,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if self.device.type == "cuda":
+                self.mixed_prefill_timer.begin(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1969,6 +1975,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
 
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx,
