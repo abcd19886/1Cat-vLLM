@@ -18,13 +18,21 @@ import torch
 from benchmark_gguf_turbomind import (
     M_VALUES,
     canonical_grouped_call,
+    core_fingerprint,
     elapsed,
+    partition_source,
     prepare_awq_comparator,
     prepare_projection,
-    transcode_projection,
 )
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.kernels.gguf import (
+    lattice_grouped_capabilities,
+    select_lattice_grouped_capability,
+)
+from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+    LatticeGGUFProjection,
+)
 from vllm.model_executor.layers.quantization.gguf_native import (
     native_available,
     pad_weight_tail,
@@ -34,7 +42,6 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
 )
 from vllm.transformers_utils.gguf_tensor_reader import (
     GGUFReader,
-    dequantize,
     quant_type_name,
 )
 
@@ -58,6 +65,9 @@ def main():
     parser.add_argument("--m", type=int, nargs="+", default=M_VALUES)
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument("--tp-axis", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     if not native_available():
         raise RuntimeError("Packaged GGUF reference extension is required")
@@ -67,8 +77,14 @@ def main():
         raise ValueError("Expected a stacked expert tensor and valid expert count")
     source = np.array(tensor.data[: args.experts], copy=True)
     weight_type = int(tensor.tensor_type)
-    canonical = [transcode_projection(expert, weight_type) for expert in source]
-    reference = dequantize(source, weight_type)
+    parts = [
+        partition_source(expert, weight_type, args.tp_size, args.tp_rank, args.tp_axis)
+        for expert in source
+    ]
+    canonical = [p[0] for p in parts]
+    reference = np.stack([p[1] for p in parts])
+    raw_available = all(p[2] is not None for p in parts)
+    raw_source = np.stack([p[2] for p in parts]) if raw_available else None
     rounding = [reconstruction_error(p, reference[e]) for e, p in enumerate(canonical)]
     prepared = [prepare_projection(p) for p in canonical]
     tm_weights, tm_stats, (wp, sp) = stack_prepared(prepared)
@@ -76,7 +92,11 @@ def main():
     awq = None
     if all(p is not None for p in awq_prepared):
         awq_weights, awq_stats, awq = stack_prepared(awq_prepared)
-    packed = pad_weight_tail(torch.from_numpy(source).cuda(), weight_type)
+    packed = (
+        pad_weight_tail(torch.from_numpy(raw_source).cuda(), weight_type)
+        if raw_available
+        else None
+    )
     dense = torch.from_numpy(reference).half().cuda()
     e, n, k = dense.shape
     projection = canonical[0]
@@ -84,11 +104,18 @@ def main():
     # type/shape availability at a supported dense batch, not at the total
     # routed row count, which has a different dense MMQ/MMVQ limit.
     probe = torch.empty((8, k), dtype=torch.float16, device="cuda")
-    caps = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
-        packed[0], probe, weight_type, n
+    caps = (
+        torch.ops._C_gguf.ggml_dense_upstream_capabilities(
+            packed[0], probe, weight_type, n
+        )
+        if packed is not None
+        else 0
     )
     output = {
+        "loaded_core_sha256": core_fingerprint(),
         "checkpoint": Path(args.gguf).name,
+        "tp": {"size": args.tp_size, "rank": args.tp_rank, "axis": args.tp_axis},
+        "native_unavailable_reason": parts[0][3],
         "tensor": tensor.name,
         "type": quant_type_name(weight_type),
         "n": n,
@@ -146,20 +173,59 @@ def main():
         routes = {
             "turbomind_gguf_grouped": (tm, True),
             "cached_fp16_per_expert_lower_bound": (cached_dense, True),
-            "dequant_cublas_grouped": (
-                partial(
-                    torch.ops._C_gguf.ggml_moe_grouped_dense,
-                    x,
-                    packed,
-                    ids,
-                    weight_type,
-                    n,
-                    1,
-                    m,
-                ),
-                False,  # The reference sorts expert IDs on the CPU.
-            ),
         }
+        if isinstance(projection, LatticeGGUFProjection):
+            declared = lattice_grouped_capabilities(weight_type, k, n, e, x.dtype)
+            selected = select_lattice_grouped_capability(declared, m)
+            routes["turbomind_gguf_grouped_selected"] = (
+                partial(
+                    getattr(torch.ops._C, selected.operator),
+                    out,
+                    x,
+                    offsets,
+                    wp,
+                    sp,
+                    weight_type,
+                    e,
+                    projection.group_size,
+                ),
+                True,
+            )
+        if isinstance(projection, LatticeGGUFProjection) and hasattr(
+            torch.ops._C, "gguf_lattice_grouped_vec_sm70_out"
+        ):
+            routes["turbomind_gguf_grouped_vec"] = (
+                partial(
+                    torch.ops._C.gguf_lattice_grouped_vec_sm70_out,
+                    out,
+                    x,
+                    offsets,
+                    wp,
+                    sp,
+                    projection.source_type,
+                    e,
+                    projection.group_size,
+                ),
+                True,
+            )
+        if packed is not None:
+            routes.update(
+                {
+                    "dequant_cublas_grouped": (
+                        partial(
+                            torch.ops._C_gguf.ggml_moe_grouped_dense,
+                            x,
+                            packed,
+                            ids,
+                            weight_type,
+                            n,
+                            1,
+                            m,
+                        ),
+                        False,  # The reference sorts expert IDs on the CPU.
+                    ),
+                }
+            )
         if awq is not None:
             routes["turbomind_awq_group128_grouped"] = (awq_call, True)
         for bit, route in ((4, "mmvq"), (8, "mmq")):
@@ -184,6 +250,17 @@ def main():
             "routes": {},
         }
         for name, (call, graph_safe) in routes.items():
+            if name in (
+                "turbomind_gguf_grouped_selected",
+                "turbomind_gguf_grouped_vec",
+            ):
+                # Out operators return None. Expose their output to elapsed()
+                # so every small-output route captures eight device calls.
+                def call_with_output(call=call, out=out):
+                    call()
+                    return out
+
+                call = call_with_output
             try:
                 call()
             except RuntimeError as error:
@@ -193,6 +270,12 @@ def main():
                     }
                     continue
                 raise
+            if name == "turbomind_gguf_grouped_vec":
+                vec_error = (out.float() - expected).norm() / expected.norm()
+                if not torch.isfinite(out).all() or vec_error.item() > 0.003:
+                    raise AssertionError(
+                        f"M={m}: grouped vector error {vec_error.item()}"
+                    )
             times = {"eager_us": elapsed(call, args.iterations)}
             if args.cuda_graph and graph_safe:
                 times["graph_us"] = elapsed(call, args.iterations, capture=True)
