@@ -48,6 +48,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 
+  ops.def(
+      "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
+  ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
   // Compatibility path for local builds where _C_stable_libtorch is not
@@ -1171,6 +1176,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
   custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
                  &sm70_tp4_all_reduce_gemma_rms_norm);
+  custom_ar.def(
+      "sm70_tp4_all_reduce_gemma_rms_norm_reference(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm_reference", torch::kCUDA,
+                 &sm70_tp4_all_reduce_gemma_rms_norm_reference);
   custom_ar.def(
       "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(int fa, Tensor inp, "
       "Tensor residual, Tensor weight, Tensor! normalized_out, Tensor! "
