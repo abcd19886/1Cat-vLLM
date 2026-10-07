@@ -364,6 +364,30 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    projection_planes: bool = True
+    """Use measured M8 shared-activation projection planes with canonical fallback."""
+
+    projection_plane_scope: Literal["all", "gated_pair", "iq3_xxs"] = "all"
+    """Select all planes, gated pairs, or XXS-containing layers for comparisons."""
+
+    qkv_three_format_planes: bool = True
+    """Admit measured M8 QKV planes mixing Q4_K, IQ4_XS and IQ3 formats."""
+
+    iq2_signed_nibbles: bool = True
+    """Expand IQ2 grids losslessly for qualified M8 gate/up and down shapes."""
+
+    small_m_dp4a: bool = True
+    """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+
+    lut4_expert_dp4a: bool = True
+    """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
+
+    small_m_hmma: bool = True
+    """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
+
+    q8_expert_intermediate: bool = True
+    """Encode routed intermediates once in qualified integer expert gate/up."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
@@ -458,6 +482,9 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_fp16_grouped_short_splits: bool = True
+    """Use K32 splits for FP16 q8/B1 grouped verification at 129..2048 tokens."""
+
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 
@@ -490,6 +517,8 @@ class KernelConfig:
     sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
     """SM70 ring collective policy, resolved from actual peer capabilities."""
 
+    hc_ll_shard: bool = True
+    """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -542,12 +571,28 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_pinned_decode: bool = True
+    """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
+    ple_pinned_decode_active: bool = Field(default=False, init=False)
+    """Whether every TP rank admitted the complete pinned decode table."""
+    ple_pinned_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed pinned row decoder admission, capacity and fallback reasons."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
     """Observed per-layer result transport and small pinned-buffer sizes."""
+
+    ple_input_prepare: bool = True
+    """Fuse qualified SM70 PLE context gathering and query-boundary staging."""
+    ple_input_preparations: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed PLE input operator selection and fallback reasons."""
 
     @field_validator("moe_backend", mode="before")
     @classmethod
@@ -579,6 +624,9 @@ class KernelConfig:
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_pinned_decoders",
+            "ple_input_prepare",  # Input staging is outside the compiled model.
+            "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",

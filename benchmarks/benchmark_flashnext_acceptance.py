@@ -25,6 +25,7 @@ from benchmarks.benchmark_sm70_qwen38_concurrency import (  # noqa: E402
     generate_cohort,
     summarize,
 )
+from benchmarks.sm70_teacher_conditions import teacher_conditions  # noqa: E402
 
 
 def digest(value):
@@ -77,14 +78,31 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
-    parser.add_argument("--input-phase-ab", action="store_true")
+    input_ab = parser.add_mutually_exclusive_group()
+    input_ab.add_argument("--input-phase-ab", action="store_true")
+    input_ab.add_argument("--ple-input-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
+    parser.add_argument("--kernel-config", type=json.loads, default={})
+    parser.add_argument("--completion-prompts", type=Path)
+    parser.add_argument("--teacher-forcing", action="store_true")
+    parser.add_argument("--teacher-reference", type=Path)
+    parser.add_argument("--teacher-positions", type=int, default=8)
     args = parser.parse_args()
     if args.trace_only:
         args.probe = args.node_trace = True
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Use a normal installed source-containing wheel")
+    if args.require_installed:
+        import flash_attn_v100
+
+        if "site-packages" not in Path(flash_attn_v100.__file__).parts:
+            raise RuntimeError("Flash-V100 must resolve from the installed artifact")
+
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+        if "site-packages" not in Path(flash_attn_v100_cuda.__file__).parts:
+            raise RuntimeError("Flash-V100 extension must resolve from the artifact")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     prompts = json.loads(args.prompts.read_text())
@@ -104,7 +122,12 @@ def main():
         disable_log_stats=False,
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
-        worker_extension_cls="vllm.sm70_graph_observer.GraphParityWorkerExtension",
+        worker_extension_cls=(
+            "vllm.sm70_gguf_quality.GGUFTeacherWorkerExtension"
+            if args.teacher_forcing
+            else "vllm.sm70_graph_observer.GraphParityWorkerExtension"
+        ),
+        kernel_config=args.kernel_config,
         speculative_config={
             "method": "mtp",
             "model": str(args.draft),
@@ -133,8 +156,17 @@ def main():
         prompt_text_sha256=digest(prompts),
         rows=[],
         probes=[],
+        completions=[],
         trace_only=args.trace_only,
     )
+    if args.require_installed:
+        report["flash_v100_artifact"] = {
+            "package": flash_attn_v100.__file__,
+            "extension": flash_attn_v100_cuda.__file__,
+            "sha256": hashlib.sha256(
+                Path(flash_attn_v100_cuda.__file__).read_bytes()
+            ).hexdigest(),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -214,6 +246,24 @@ def main():
                 ),
                 flush=True,
             )
+        if args.completion_prompts is not None:
+            for prompt in json.loads(args.completion_prompts.read_text()):
+                rendered = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                output = llm.generate(rendered, params, use_tqdm=False)[0].outputs[0]
+                report["completions"].append(
+                    dict(
+                        prompt=prompt,
+                        text=output.text,
+                        output_token_ids=list(output.token_ids),
+                        finish_reason=output.finish_reason,
+                    )
+                )
+                save()
         if args.probe:
             reference = tokenized[1]
             fixed_ids = (reference * (8192 // len(reference) + 1))[:8192]
@@ -231,7 +281,9 @@ def main():
                 )
                 save()
             arms = (
-                ("late_observed", "early_observed", "early_off", "late_off")
+                ("fused_observed", "reference_observed", "reference_off", "fused_off")
+                if args.ple_input_ab
+                else ("late_observed", "early_observed", "early_off", "late_off")
                 if args.input_phase_ab
                 else ("off_before", "cpu_observed", "off_after")
             )
@@ -240,6 +292,12 @@ def main():
                     llm.collective_rpc(
                         "set_graph_input_preparation",
                         args=(arm.startswith("early"),),
+                        timeout=30,
+                    )
+                elif args.ple_input_ab:
+                    llm.collective_rpc(
+                        "set_ple_input_preparation",
+                        args=(arm.startswith("fused"),),
                         timeout=30,
                     )
                 observing = arm == "cpu_observed" or arm.endswith("_observed")
@@ -260,24 +318,39 @@ def main():
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
-            if args.input_phase_ab:
+            if args.input_phase_ab or args.ple_input_ab:
                 llm.collective_rpc(
-                    "set_graph_input_preparation", args=(True,), timeout=30
+                    "set_ple_input_preparation"
+                    if args.ple_input_ab
+                    else "set_graph_input_preparation",
+                    args=(True,),
+                    timeout=30,
                 )
             if not args.trace_only:
                 c4_ids = fixed_ids[:128]
                 c4_params = SamplingParams(
                     temperature=0, max_tokens=600, ignore_eos=True
                 )
-                c4_phases = (False, True) if args.input_phase_ab else (True,)
+                c4_phases = (
+                    (False, True)
+                    if args.input_phase_ab or args.ple_input_ab
+                    else (True,)
+                )
                 report["c4_probes"] = []
                 for early in c4_phases:
-                    if args.input_phase_ab:
+                    if args.input_phase_ab or args.ple_input_ab:
                         llm.collective_rpc(
-                            "set_graph_input_preparation", args=(early,), timeout=30
+                            "set_ple_input_preparation"
+                            if args.ple_input_ab
+                            else "set_graph_input_preparation",
+                            args=(early,),
+                            timeout=30,
                         )
                     steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
                     cohort = dict(
+                        input_switch="ple_input_prepare"
+                        if args.ple_input_ab
+                        else "early",
                         early=early,
                         summary=summarize(steps, 4),
                         output_token_ids=[
@@ -314,6 +387,59 @@ def main():
                     save()
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)
+        if args.teacher_forcing:
+            reference = (
+                json.loads(args.teacher_reference.read_text())
+                if args.teacher_reference is not None
+                else report
+            )
+            if reference["prompt_tokens_sha256"] != report["prompt_tokens_sha256"]:
+                raise RuntimeError(
+                    "Teacher prompts/tokenizer differ from the reference"
+                )
+            root = args.output.with_suffix("").with_name(args.output.stem + "-teacher")
+            root.mkdir(parents=True, exist_ok=True)
+            report["teacher_forcing"] = dict(directory=str(root), rows=[])
+            report["teacher_forcing"]["reference"] = (
+                str(args.teacher_reference) if args.teacher_reference else None
+            )
+            for key, prefix, forced in teacher_conditions(
+                reference, args.teacher_positions
+            ):
+                llm.collective_rpc(
+                    "start_teacher_capture", args=(str(root), key), timeout=30
+                )
+                try:
+                    llm.generate(
+                        {"prompt_token_ids": prefix},
+                        SamplingParams(
+                            temperature=0, max_tokens=6, allowed_token_ids=[forced]
+                        ),
+                        use_tqdm=False,
+                    )
+                finally:
+                    workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
+                if any(w["captured"] != 1 for w in workers):
+                    raise RuntimeError(f"M5 teacher target was not captured: {workers}")
+                captured = torch.load(root / f"{key}.pt", weights_only=True)
+                if (
+                    captured["position"].item() != len(prefix)
+                    or captured["input_ids"].item() != forced
+                ):
+                    raise RuntimeError(
+                        "Captured distribution has different teacher conditioning"
+                    )
+                report["teacher_forcing"]["rows"].append(
+                    dict(
+                        key=key,
+                        prefix_sha256=digest(prefix),
+                        prefix_token_ids=list(prefix),
+                        forced=forced,
+                        position=len(prefix),
+                        workers=workers,
+                    )
+                )
+                save()
         report["complete"] = True
         save()
     finally:
