@@ -91,6 +91,9 @@ class PleOffloadConnector:
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
         self._layers = self._setup_layers(vllm_config, model)
+        self._all_pinned_decode = bool(self._layers) and all(
+            getattr(layer, "_pinned_decode", False) for layer in self._layers.values()
+        )
 
         # Both runner paths stage into the same shared buffers. TP0 registers
         # them with CUDA so MRV2 can use asynchronous D2H copies.
@@ -197,7 +200,10 @@ class PleOffloadConnector:
                 region = None
                 reason = None
                 if mode != "cuda":
-                    if vllm_config.speculative_config is not None:
+                    if (
+                        vllm_config.speculative_config is not None
+                        and vllm_config.speculative_config.method != "mtp"
+                    ):
                         reason = "speculative_transport_not_qualified"
                     elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
                         reason = "hybrid_local_decode"
@@ -501,7 +507,9 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_local_model:
+        if use_local_model and (
+            envs.VLLM_SM70_QWEN38_HYBRID_PLE or self._all_pinned_decode
+        ):
             return
         self._launch(num_reqs, num_tokens)
 
