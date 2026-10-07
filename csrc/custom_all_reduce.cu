@@ -545,7 +545,8 @@ void sm70_all_reduce_gemma_rms_norm_impl(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_buffer,
-    int64_t reg_buffer_sz_bytes, double epsilon) {
+    int64_t reg_buffer_sz_bytes, double epsilon,
+    bool benchmark_reference = false) {
   constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
@@ -638,12 +639,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     }
   } else if constexpr (kWorldSize == 2) {
     auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
@@ -651,12 +654,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, float>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
-          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f,
+          benchmark_reference);
     }
   }
 }
@@ -681,6 +686,16 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
   sm70_all_reduce_gemma_rms_norm_impl<4>(
       _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
       reg_buffer_sz_bytes, epsilon);
+}
+
+void sm70_tp4_all_reduce_gemma_rms_norm_reference(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  sm70_all_reduce_gemma_rms_norm_impl<4>(
+      _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+      reg_buffer_sz_bytes, epsilon, true);
 }
 
 void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
@@ -952,8 +967,8 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
                           torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll,
-                          bool fused_chain) {
+                          bool cooperative, bool full_unroll, bool fused_chain,
+                          int64_t cta_split_warps) {
 #if defined(USE_ROCM)
   TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
 #else
@@ -1000,7 +1015,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
       reinterpret_cast<half*>(output.data_ptr()),
       reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
       cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
-      fused_chain);
+      fused_chain, cta_split_warps);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }
@@ -1179,8 +1194,9 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 
   TORCH_CHECK(input_pair.scalar_type() == at::ScalarType::Float);
   TORCH_CHECK(output.scalar_type() == at::ScalarType::Long);
-  TORCH_CHECK(input_pair.numel() == 2);
-  TORCH_CHECK(output.numel() == 1);
+  TORCH_CHECK(input_pair.numel() >= 2 && input_pair.numel() <= 256 &&
+              input_pair.numel() % 2 == 0);
+  TORCH_CHECK(output.numel() == input_pair.numel() / 2);
   TORCH_CHECK(_is_weak_contiguous(input_pair));
   TORCH_CHECK(_is_weak_contiguous(output));
 
@@ -1195,7 +1211,8 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
   }
 
   fa->top1_argmax(stream, reinterpret_cast<float*>(reg_buffer),
-                  reinterpret_cast<int64_t*>(output.data_ptr()));
+                  reinterpret_cast<int64_t*>(output.data_ptr()),
+                  input_pair.numel() / 2);
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

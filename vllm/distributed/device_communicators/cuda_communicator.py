@@ -90,7 +90,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_top1_custom_ar = envs.VLLM_SM70_TOP1_CUSTOM_AR
+            use_top1_custom_ar = (
+                envs.VLLM_SM70_TOP1_CUSTOM_AR
+                and current_platform.is_device_capability(70)
+            )
             use_sm70_awq_mlp_down_tile_ar = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR
             use_sm70_awq_mlp_down_tile_overlap = (
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
@@ -202,6 +205,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ring_comm = Sm70RingCommunicator(
             self.cpu_group, self.device, self.unique_name, use_custom_allreduce
+        )
+        from .sm70_hc_ll import Sm70HcLLCommunicator
+
+        self.hc_ll_comm = Sm70HcLLCommunicator(
+            self.cpu_group, self.device, self.unique_name
         )
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -655,6 +663,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        hc_ll_comm = getattr(self, "hc_ll_comm", None)
+        if hc_ll_comm is not None:
+            hc_ll_comm.close()
         ring_comm = getattr(self, "ring_comm", None)
         if ring_comm is not None:
             ring_comm.close()

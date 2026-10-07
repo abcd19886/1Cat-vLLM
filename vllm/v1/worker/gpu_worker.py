@@ -963,6 +963,11 @@ class Worker(WorkerBase):
 
         selections = self.vllm_config.kernel_config.linear_kernel_selections
         transports = self.vllm_config.kernel_config.ple_result_transports
+        row_readers = (
+            self._ple_offload_worker_handle.row_readers
+            if self._ple_offload_worker_handle is not None
+            else {}
+        )
         manager = getattr(self.model_runner, "cudagraph_manager", None)
         mode = (
             self.compilation_config.cudagraph_mode
@@ -981,8 +986,42 @@ class Worker(WorkerBase):
                 self.vllm_config.kernel_config.collective_kernel_selections
             ),
             "ple_result_transports": transports,
+            "ple_disk_row_readers": row_readers,
+            "ple_pinned_decoders": self.vllm_config.kernel_config.ple_pinned_decoders,
+            "ple_pinned_tables": [
+                {
+                    "layer": name,
+                    "packed_bytes": module.ple_host_storage.numel(),
+                    "rows": module._host_rows,
+                    "source_type": module._source_type,
+                }
+                for name, module in self.model_runner.model.named_modules()
+                if hasattr(module, "_pinned_codebook")
+            ],
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
+            "model_input_preparation": {
+                "scope": "model_state_capability",
+                "full_graph_phase": (
+                    "before_attention_metadata"
+                    if getattr(
+                        getattr(self.model_runner, "model_state", None),
+                        "supports_early_input_preparation",
+                        False,
+                    )
+                    else "after_attention_metadata"
+                ),
+                "fallback_reason": (
+                    None
+                    if getattr(
+                        getattr(self.model_runner, "model_state", None),
+                        "supports_early_input_preparation",
+                        False,
+                    )
+                    else "model_state_has_not_declared_independent_inputs"
+                ),
+                "stream_order": "current_cuda_stream",
+            },
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
         }
         if manager is not None:
