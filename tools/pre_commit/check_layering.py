@@ -51,7 +51,7 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 OWNER_PATH = re.compile(
     r"^vllm/(?:models|model_executor/models|sm70_profiles)/"
     r"|sm_?70|v100|volta|turbomind|dflash|ddtree|qwen4_exp|flash_?next|gguf"
-    r"|_custom_ops\.py$|_sm70_ops\.py$",
+    r"|model_executor/kernels/linear/qpn/|_custom_ops\.py$|_sm70_ops\.py$",
     re.IGNORECASE,
 )
 # Configuration registries own every kind of knob by design.
@@ -72,6 +72,64 @@ def tracked_python() -> list[str]:
         check=True,
     ).stdout
     return sorted(set(out.split()))
+
+
+def without_alias_declarations(text: str) -> str:
+    """Literal alias tables describe ownership, rather than execute a provider.
+
+    Recognize their structure, not their file location. Runtime env attributes,
+    getter calls, imports and model/shape branches remain counted; the parameter
+    inventory separately records every removed declaration and its consumers.
+    """
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    chars = list(text)
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            parts = [key, value]
+            if not any(
+                isinstance(part, ast.Constant)
+                and isinstance(part.value, str)
+                and part.value.startswith(("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_"))
+                and part.value.isidentifier()
+                for part in parts
+            ):
+                continue
+            # Calls/comprehensions are computation, even inside an alias table.
+            if any(
+                isinstance(
+                    child,
+                    (
+                        ast.Call,
+                        ast.ListComp,
+                        ast.DictComp,
+                        ast.SetComp,
+                        ast.GeneratorExp,
+                    ),
+                )
+                for part in parts
+                if part is not None
+                for child in ast.walk(part)
+            ):
+                continue
+            if not all(isinstance(part, (ast.Constant, ast.Tuple)) for part in parts):
+                continue
+            for part in parts:
+                for leaf in ast.walk(part):
+                    if not isinstance(leaf, ast.Constant) or not isinstance(
+                        leaf.value, str
+                    ):
+                        continue
+                    start = offsets[leaf.lineno - 1] + leaf.col_offset
+                    end = offsets[leaf.end_lineno - 1] + leaf.end_col_offset
+                    for index in range(start, end):
+                        if chars[index] != "\n":
+                            chars[index] = " "
+    return "".join(chars)
 
 
 def measure(path: str, text: str) -> dict[str, int]:
@@ -95,11 +153,12 @@ def measure(path: str, text: str) -> dict[str, int]:
         hits = len(re.findall(r"dflash|ddtree|mtp|qwen|glm", ast.unparse(tree), re.I))
         if hits:
             counts["flash_v100_model"] = hits
+    ownership_text = without_alias_declarations(text)
     owner = bool(OWNER_PATH.search(path))
     for kind, pattern in PATTERNS.items():
         if kind in ("model", "platform") and owner:
             continue
-        hits = len(pattern.findall(text))
+        hits = len(pattern.findall(text if kind == "env" else ownership_text))
         if hits:
             counts[kind] = hits
     return counts
@@ -146,6 +205,34 @@ def main() -> int:
             current.items(), key=lambda item: -sum(item[1].values())
         )[:40]:
             print(f"{sum(counts.values()):6d}  {path}  {counts}")
+        sys.path.insert(0, str(ROOT))
+        from tools.config_inventory import collect as collect_parameters
+        from tools.config_inventory import summary
+
+        inventory = collect_parameters()
+        print("Parameter inventory (source references, not runtime hits):")
+        print(json.dumps(summary(inventory), indent=1))
+        print("Retained deprecated inputs:")
+        for name, row in inventory["parameters"].items():
+            metadata = row["metadata"]
+            if metadata.get("deprecated") or metadata.get("category") == "deprecated":
+                print(
+                    json.dumps(
+                        {
+                            "name": name,
+                            **{
+                                field: metadata.get(field)
+                                for field in (
+                                    "deprecation_kind",
+                                    "deprecation_reason",
+                                    "deprecation_evidence",
+                                    "replacement",
+                                )
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                )
         return 0
 
     if not BASELINE.exists():

@@ -15,6 +15,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.execution_policy import graph_policy
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -111,7 +112,7 @@ def get_sm70_cudagraph_memory_reserve(
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
-        envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
+        vllm_config.compilation_config.runtime.split_draft_graphs
         and speculative_config is not None
         and speculative_config.method == "mtp"
         and _worker_device_is_pre_ampere()
@@ -226,7 +227,7 @@ class CudaGraphManager:
                     self.decode_query_lens,
                 )
         self._sm70_dflash2_tail_graphs = bool(
-            envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            vllm_config.attention_config.flash_v100.options.value("tail_cudagraphs")
             and isinstance(self, ModelCudaGraphManager)
             and speculative_config is not None
             and speculative_config.method == "dflash"
@@ -422,7 +423,7 @@ class CudaGraphManager:
                                 f"Graph already captured for {desc}"
                             )
                             if (
-                                envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                                graph_policy().compile_graph
                                 and _worker_device_is_pre_ampere()
                             ):
                                 logger.info_once(
@@ -480,6 +481,19 @@ class CudaGraphManager:
         self.graphs[desc].replay()
 
 
+def _qsa_dense_short_context_budget(vllm_config: VllmConfig) -> int | None:
+    """Indexer budget when QSA may attend densely within it, else None."""
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    if not getattr(kernel_config, "qsa_dense_short_context", False):
+        return None
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = (
+        model_config.hf_config.get_text_config() if model_config is not None else None
+    )
+    budget = getattr(text_config, "indexer_budget", None)
+    return int(budget) if budget else None
+
+
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
 
@@ -509,7 +523,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         )
 
         if (
-            long_attention_enabled()
+            long_attention_enabled(vllm_config.attention_config.flash_v100.options)
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and self.dp_size == 1
@@ -520,13 +534,24 @@ class ModelCudaGraphManager(CudaGraphManager):
             # no model config leaves the bound at the declared capability.
             model_config = getattr(vllm_config, "model_config", None)
             served = int(getattr(model_config, "max_model_len", 0) or 0)
-            context_limit, query_rows = long_attention_graph_contract(served or None)
-            max_batch_size = min(self.max_num_reqs, long_attention_max_batch_size())
+            context_limit, query_rows = long_attention_graph_contract(
+                served or None, policy=vllm_config.attention_config.flash_v100.options
+            )
+            max_batch_size = min(
+                self.max_num_reqs,
+                long_attention_max_batch_size(
+                    policy=vllm_config.attention_config.flash_v100.options
+                ),
+            )
             if not _supports_sm70_long_batch_graphs(vllm_config):
                 max_batch_size = 1
             if context_limit is not None:
                 if self._sm70_dflash2_tail_graphs and (
-                    bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                    bool(
+                        vllm_config.attention_config.flash_v100.options.value(
+                            "scalar_tail_manifest"
+                        )
+                    )
                     or scalar_tail_attention_available()
                 ):
                     query_rows = (1, *query_rows)
@@ -559,10 +584,47 @@ class ModelCudaGraphManager(CudaGraphManager):
                     served or "unknown",
                     scope="process",
                 )
+        self._qsa_short_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
+        budget = _qsa_dense_short_context_budget(vllm_config)
+        if budget is not None:
+            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+            for desc in list(descs):
+                # Uniform MTP verification batches only: every request holds
+                # exactly decode_query_len tokens.
+                if (
+                    desc.attention_context_bucket is None
+                    and desc.num_reqs is not None
+                    and desc.uniform_token_count == self.decode_query_len
+                    and desc.num_tokens == desc.num_reqs * self.decode_query_len
+                ):
+                    variant = replace(desc, attention_context_bucket=budget)
+                    self._qsa_short_graphs[desc] = variant
+                    descs.append(variant)
+            logger.info_once(
+                "QSA short-context graph variants captured at bound=%d for %d "
+                "decode batch shapes.",
+                budget,
+                len(self._qsa_short_graphs),
+                scope="process",
+            )
 
     def select_attention_graph(
         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
     ) -> BatchExecutionDescriptor:
+        short = self._qsa_short_graphs.get(desc)
+        if (
+            short is not None
+            and short in self.graphs
+            and short.attention_context_bucket is not None
+            and cpu_upper_bounds.device.type == "cpu"
+            and cpu_upper_bounds.ndim == 1
+            and desc.num_reqs is not None
+            and 0 < cpu_upper_bounds.numel() <= desc.num_reqs
+            and 0 < int(cpu_upper_bounds.max()) <= short.attention_context_bucket
+        ):
+            return short
         variant = self._long_attention_graphs.get(desc)
         if variant is None or variant not in self.graphs:
             return desc

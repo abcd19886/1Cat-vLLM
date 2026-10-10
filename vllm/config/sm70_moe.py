@@ -2,13 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-engine MoE policy and the sole adapter for migrated legacy switches."""
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field
 
+from vllm.config.diagnostic_dump import TensorDumpConfig
+from vllm.config.execution_policy_base import DeferredExecutionPolicy
+from vllm.config.legacy_inputs import LegacyInputs
+from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
 MoEFormat = Literal["awq", "fp8"]
+FP8_STAGE_ALIASES = {
+    "single_token_w2": "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH",
+}
+FP4_DIAGNOSTIC_ALIASES = {"route_debug": "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"}
+FP8_COMPACT_ALIASES = {
+    "compact_exact_layout": (
+        "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT"
+    ),
+    "compact_native_unpermute": (
+        "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE"
+    ),
+    "compact_decomposed": "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED",
+}
 W13Mode = Literal["dense", "indexed", "compact"]
 W2Mode = Literal["dense", "indexed"]
 ReduceMode = Literal["unpermute", "weighted"]
@@ -78,14 +95,42 @@ NATIVE_LEGACY_ALIASES = frozenset(
 
 
 def _validate_native_legacy_request(policy, field: str, name: str) -> None:
-    from vllm import envs
+    from vllm._sm70.policy import native_policy_abi_available
 
-    if name in NATIVE_LEGACY_ALIASES and getattr(policy, field) != getattr(envs, name):
+    if native_policy_abi_available():
+        return
+    if name in NATIVE_LEGACY_ALIASES and getattr(policy, field) != policy.legacy.value(
+        name
+    ):
         raise ValueError(
             f"sm70_moe.{field} conflicts with {name}: the current native ABI "
             "also consumes this legacy switch. Use matching values until the "
             "native policy-argument ABI is installed."
         )
+
+
+# Diagnostics share one compatibility declaration with compile-cache filtering.
+AWQ_DUMP_ALIASES = {
+    "dump_buffers": ("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS", None),
+    "dump_dir": ("VLLM_SM70_DUMP_QWEN_LAYER_DIR", None),
+    "dump_layers": ("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1"),
+    "dump_labels": ("VLLM_SM70_DUMP_AWQ_MOE_LABELS", ""),
+}
+AWQ_COMPARE_ALIASES = {
+    "compare_dir": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR",
+    "compare_enable_file": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE",
+    "compare_layers": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS",
+    "compare_steps": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS",
+    "compare_max_reports": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS",
+}
+FP8_COMPARE_ALIASES = {
+    "compact_compare": ("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE", "0"),
+    "compact_compare_reports": (
+        "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS",
+        "16",
+    ),
+    "strict_compare_fail": ("VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL", "0"),
+}
 
 
 @config
@@ -117,61 +162,80 @@ class Sm70MoEDiagnostics:
     strict_compare_fail: bool | None = None
     """Retained FP8 legacy no-op warning; never changes arithmetic."""
 
+    dump_policy: TensorDumpConfig | None = Field(default=None, init=False)
+    """Canonical observer projection; compatibility fields above retain old access."""
+    compare_policy: TensorDumpConfig | None = Field(default=None, init=False)
+    """Canonical comparison policy shared with the engine diagnostic owner."""
+
+    def bind(self, family: MoEFormat, dumps) -> None:
+        bindings = MOE_DIAGNOSTIC_BINDINGS[family]
+        for old, (channel, field) in bindings.items():
+            setattr(self, old, getattr(getattr(dumps, channel), field))
+        self.dump_policy = dumps.awq_buffers if family == "awq" else None
+        self.compare_policy = getattr(dumps, f"{family}_compare")
+
     def resolve(self, family: MoEFormat) -> None:
-        import os
+        if self.compare_policy is None:
+            # Independent no-engine compatibility entry, resolved once per owner.
+            from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
 
-        from vllm import envs
+            dumps = TensorDiagnosticsConfig()
+            _project_moe_diagnostic_inputs(self, family, dumps)
+            dumps.project_shared_fields()
+            self.bind(family, dumps)
+        # Preserve the qualified format initialization error checkpoint.
+        fields = (
+            ("max_dumps",)
+            if family == "awq"
+            else ("enabled", "max_dumps", "strict_fail")
+        )
+        assert self.compare_policy is not None
+        for field in fields:
+            self.compare_policy.value(field)
 
-        if family == "awq":
-            raw = {
-                "dump_buffers": ("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS", None),
-                "dump_dir": ("VLLM_SM70_DUMP_QWEN_LAYER_DIR", None),
-                "dump_layers": ("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1"),
-                "dump_labels": ("VLLM_SM70_DUMP_AWQ_MOE_LABELS", ""),
-            }
-            for field, (name, default) in raw.items():
-                if getattr(self, field) is None:
-                    value = os.getenv(name, default)
-                    setattr(
-                        self, field, value == "1" if field == "dump_buffers" else value
-                    )
-            registered = {
-                "compare_dir": "DIR",
-                "compare_enable_file": "ENABLE_FILE",
-                "compare_layers": "LAYER_IDS",
-                "compare_steps": "STEPS",
-                "compare_max_reports": "MAX_REPORTS",
-            }
-            for field, suffix in registered.items():
-                if getattr(self, field) is None:
-                    setattr(
-                        self,
-                        field,
-                        getattr(envs, "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_" + suffix),
-                    )
-        else:
-            for field, suffix, default in (
-                ("compact_compare", "COMPARE", "0"),
-                ("compact_compare_reports", "COMPARE_REPORTS", "16"),
-            ):
-                if getattr(self, field) is None:
-                    numeric_value = int(
-                        os.getenv(
-                            "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_" + suffix,
-                            default,
-                        )
-                    )
-                    setattr(
-                        self,
-                        field,
-                        bool(numeric_value)
-                        if field == "compact_compare"
-                        else numeric_value,
-                    )
-            if self.strict_compare_fail is None:
-                self.strict_compare_fail = (
-                    envs.VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL
-                )
+
+MOE_DIAGNOSTIC_BINDINGS = {
+    "awq": {
+        "dump_buffers": ("awq_buffers", "enabled"),
+        "dump_dir": ("qwen_layer", "directory"),
+        "dump_layers": ("qwen_layer", "layers"),
+        "dump_labels": ("awq_buffers", "labels"),
+        "compare_dir": ("awq_compare", "directory"),
+        "compare_enable_file": ("awq_compare", "enable_file"),
+        "compare_layers": ("awq_compare", "layers"),
+        "compare_steps": ("awq_compare", "steps"),
+        "compare_max_reports": ("awq_compare", "max_dumps"),
+    },
+    "fp8": {
+        "compact_compare": ("fp8_compare", "enabled"),
+        "compact_compare_reports": ("fp8_compare", "max_dumps"),
+        "strict_compare_fail": ("fp8_compare", "strict_fail"),
+    },
+}
+
+
+def _project_moe_diagnostic_inputs(legacy, family, dumps) -> None:
+    if legacy.compare_policy is not None:
+        return
+    for old, (channel, field) in MOE_DIAGNOSTIC_BINDINGS[family].items():
+        value = getattr(legacy, old)
+        policy = getattr(dumps, channel)
+        if value is not None and policy.sources.get(field) != "typed":
+            setattr(policy, field, value)
+            policy.sources[field] = f"kernel_config.sm70_moe.{family}.diagnostics.{old}"
+            policy.filter_errors.pop(field, None)
+            policy.parse_filters(channel)
+
+
+def bind_moe_diagnostics(kernel, trace) -> None:
+    """Resolve B typed aliases before workers, with observability overrides first."""
+    for family in ("awq", "fp8"):
+        _project_moe_diagnostic_inputs(
+            getattr(kernel.sm70_moe, family).diagnostics, family, trace.dumps
+        )
+    trace.dumps.project_shared_fields()
+    for family in ("awq", "fp8"):
+        getattr(kernel.sm70_moe, family).diagnostics.bind(family, trace.dumps)
 
 
 @config
@@ -182,6 +246,8 @@ class Sm70MoEFormatConfig:
     that is absent therefore retains the old dense fallback, not a new error.
     """
 
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selector and tuning policy, shared with kernel bindings."""
     qpn_m1: bool | None = None
     """AWQ native-g32 Qwen QPN M1 request; original strict admission applies."""
     batched: bool | None = None
@@ -237,8 +303,21 @@ class Sm70MoEFormatConfig:
     explicit_fields: tuple[str, ...] = Field(default=(), init=False)
     """Explicit requests, retained for the existing fail-closed gates."""
 
+    legacy: LegacyInputs = Field(default_factory=LegacyInputs)
+    """Frozen worker compatibility inputs, excluded from calculation hashes."""
+
+    def capture_inputs(self, family: MoEFormat) -> None:
+        names = [*ALIASES[family].values()]
+        for aliases in COMMON_ALIASES.values():
+            names.extend(aliases)
+        if family == "fp8":
+            names.extend(FP8_COMPACT_ALIASES.values())
+            names.extend(FP8_STAGE_ALIASES.values())
+        self.legacy.capture(names)
+        self.native.capture_inputs()
+
     def resolve(self, family: MoEFormat) -> None:
-        from vllm import envs
+        self.capture_inputs(family)
 
         if self.resolved:
             return
@@ -249,23 +328,27 @@ class Sm70MoEFormatConfig:
                 "compact_native_unpermute",
                 "compact_decomposed",
             }
-        metadata = {"resolved", "sources", "explicit_fields", "diagnostics"}
+        metadata = {
+            "resolved",
+            "sources",
+            "explicit_fields",
+            "diagnostics",
+            "native",
+            "legacy",
+        }
         for field, supplied_value in vars(self).items():
             if field not in supported | metadata and supplied_value is not None:
                 raise ValueError(f"sm70_moe.{family}.{field} is not supported")
         self.diagnostics.resolve(family)
         if family == "fp8":
-            import os
-
-            for field, suffix, default in (
-                ("compact_exact_layout", "EXACT_LAYOUT", "1"),
-                ("compact_native_unpermute", "NATIVE_UNPERMUTE", "0"),
-                ("compact_decomposed", "DECOMPOSED", "0"),
-            ):
+            for field, name in FP8_COMPACT_ALIASES.items():
                 if getattr(self, field) is None:
-                    name = "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_" + suffix
-                    setattr(self, field, bool(int(os.getenv(name, default))))
-                    self.sources[field] = name if name in os.environ else "default"
+                    raw = self.legacy.value(name)
+                    default = "1" if field == "compact_exact_layout" else "0"
+                    setattr(self, field, bool(int(default if raw is None else raw)))
+                    self.sources[field] = (
+                        name if self.legacy.is_set(name) else "default"
+                    )
                 else:
                     self.sources[field] = "configuration"
         explicit = []
@@ -275,9 +358,9 @@ class Sm70MoEFormatConfig:
                 self.sources[field] = "configuration"
                 explicit.append(field)
             else:
-                setattr(self, field, getattr(envs, name))
-                self.sources[field] = name if envs.is_set(name) else "default"
-                if envs.is_set(name):
+                setattr(self, field, self.legacy.value(name))
+                self.sources[field] = name if self.legacy.is_set(name) else "default"
+                if self.legacy.is_set(name):
                     explicit.append(field)
 
         for field, names in COMMON_ALIASES.items():
@@ -289,8 +372,8 @@ class Sm70MoEFormatConfig:
                 value: Any = tuple(
                     mode
                     for mode, requested in (
-                        ("compact", getattr(envs, names[0])),
-                        ("indexed", any(getattr(envs, name) for name in names[1:])),
+                        ("compact", self.legacy.value(names[0])),
+                        ("indexed", any(self.legacy.value(name) for name in names[1:])),
                         ("dense", True),
                     )
                     if requested
@@ -298,20 +381,22 @@ class Sm70MoEFormatConfig:
             elif field == "single_token_w2":
                 if family == "fp8":
                     names = (
-                        "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH",
+                        FP8_STAGE_ALIASES[field],
                         *names,
                     )
                 value = (
-                    "indexed" if any(getattr(envs, name) for name in names) else "dense"
+                    "indexed"
+                    if any(self.legacy.value(name) for name in names)
+                    else "dense"
                 )
             else:
                 value = (
                     "weighted"
-                    if any(getattr(envs, name) for name in names)
+                    if any(self.legacy.value(name) for name in names)
                     else "unpermute"
                 )
             setattr(self, field, value)
-            enabled_aliases = [name for name in names if envs.is_set(name)]
+            enabled_aliases = [name for name in names if self.legacy.is_set(name)]
             self.sources[field] = ",".join(enabled_aliases) or "default"
             if enabled_aliases:
                 explicit.append(field)
@@ -345,13 +430,24 @@ class Sm70MoEFormatConfig:
                 mode for mode in priority if mode in self.single_token_w13
             )
         self.explicit_fields = tuple(explicit)
+        overrides = {
+            alias: getattr(self, field)
+            for field, alias in ALIASES[family].items()
+            if self.sources.get(field) == "configuration"
+        }
+        if self.sources.get("single_token_reduce") == "configuration":
+            overrides["VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH"] = (
+                self.single_token_reduce == "weighted"
+            )
+        self.native.resolve(family, overrides)
         self.resolved = True
 
     def hash_options(self) -> dict[str, Any]:
         return {
-            name: value
+            name: (self.native.hash_options() if name == "native" else value)
             for name, value in vars(self).items()
-            if name not in {"resolved", "sources", "explicit_fields", "diagnostics"}
+            if name
+            not in {"resolved", "sources", "explicit_fields", "diagnostics", "legacy"}
         }
 
 
@@ -393,6 +489,8 @@ MXFP4_ALIASES = {
 class Sm70MoELegacyConfig:
     """Initialization-only alias adapter shared by the native FP4 formats."""
 
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selector and tuning policy, shared with kernel bindings."""
     resolved: bool = Field(default=False, init=False)
     """Whether this engine has captured compatibility inputs."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
@@ -400,8 +498,16 @@ class Sm70MoELegacyConfig:
     explicit_fields: tuple[str, ...] = Field(default=(), init=False)
     """Explicit requests preserve the old missing-operator error behavior."""
 
-    def _resolve(self, aliases: dict[str, str]) -> None:
-        from vllm import envs
+    legacy: LegacyInputs = Field(default_factory=LegacyInputs)
+    """Frozen worker compatibility inputs, excluded from calculation hashes."""
+
+    def capture_inputs(self, family: str) -> None:
+        aliases = NVFP4_ALIASES if family == "nvfp4" else MXFP4_ALIASES
+        self.legacy.capture((*aliases.values(), *FP4_DIAGNOSTIC_ALIASES.values()))
+        self.native.capture_inputs()
+
+    def _resolve(self, aliases: dict[str, str], family: str) -> None:
+        self.capture_inputs(family)
 
         if self.resolved:
             return
@@ -412,18 +518,27 @@ class Sm70MoELegacyConfig:
                 self.sources[field] = "configuration"
                 explicit.append(field)
             else:
-                setattr(self, field, getattr(envs, name))
-                self.sources[field] = name if envs.is_set(name) else "default"
-                if envs.is_set(name):
+                setattr(self, field, self.legacy.value(name))
+                self.sources[field] = name if self.legacy.is_set(name) else "default"
+                if self.legacy.is_set(name):
                     explicit.append(field)
         self.explicit_fields = tuple(explicit)
+        self.native.resolve(
+            family,
+            {
+                alias: getattr(self, field)
+                for field, alias in aliases.items()
+                if self.sources.get(field) == "configuration"
+            },
+        )
         self.resolved = True
 
     def hash_options(self) -> dict[str, Any]:
         return {
-            name: value
+            name: (self.native.hash_options() if name == "native" else value)
             for name, value in vars(self).items()
-            if name not in {"resolved", "sources", "explicit_fields", "route_debug"}
+            if name
+            not in {"resolved", "sources", "explicit_fields", "route_debug", "legacy"}
         }
 
 
@@ -469,11 +584,12 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
     """Historical Qwen route diagnostic, excluded from the calculation hash."""
 
     def resolve(self) -> None:
+        self.capture_inputs("nvfp4")
         if self.route_debug is None:
-            import os
-
-            self.route_debug = os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1"
-        self._resolve(NVFP4_ALIASES)
+            self.route_debug = (
+                self.legacy.value(FP4_DIAGNOSTIC_ALIASES["route_debug"]) == "1"
+            )
+        self._resolve(NVFP4_ALIASES, "nvfp4")
 
 
 @config
@@ -502,12 +618,59 @@ class Sm70MxFp4MoEConfig(Sm70MoELegacyConfig):
     """Initialization override for VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH."""
 
     def resolve(self) -> None:
-        self._resolve(MXFP4_ALIASES)
+        self._resolve(MXFP4_ALIASES, "mxfp4")
+
+
+@config
+class Sm70UnquantizedMoEConfig(DeferredExecutionPolicy):
+    """One initialized policy for warmup and unquantized execution."""
+
+    legacy_tiles: bool | None = None
+    """Retain the existing 0.0.3 SM70 tile selection."""
+    functional: bool | None = None
+    """Retain the functional expert implementation at its layout gates."""
+    disable_inplace: bool | None = None
+    """Keep the explicit override disabling in-place output."""
+    mtp_tuned: bool | None = None
+    """Retain exact-shape MTP tiles in warmup and execution."""
+    mtp_fp16_exact: bool | None = None
+    """Retain the exact FP16 MTP native provider."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "legacy_tiles": "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
+        "functional": "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL",
+        "disable_inplace": "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE",
+        "mtp_tuned": "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
+        "mtp_fp16_exact": "VLLM_SM70_MTP_MOE_FP16_EXACT",
+    }
+
+
+@config
+class Sm70MoERoutingPolicy(DeferredExecutionPolicy):
+    """Common router schedule, independent of expert weight quantization."""
+
+    exact_topk: bool | None = None
+    """Enable the retained E512/K10 exact router at dynamic M1..16."""
+    mtp_top16: bool | None = None
+    """Use partial selection at the existing FP16 M5/M10 gates."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "exact_topk": "VLLM_SM70_QWEN38_ROUTER_TOPK",
+        "mtp_top16": "VLLM_SM70_MTP_ROUTER_TOP16",
+    }
 
 
 @config
 class Sm70MoEConfig:
     """Resolve only loaded families; unused options do not salt graph caches."""
+
+    routing: Sm70MoERoutingPolicy = Field(default_factory=Sm70MoERoutingPolicy)
+    """Shared router policy for every expert weight format."""
+
+    unquantized: Sm70UnquantizedMoEConfig = Field(
+        default_factory=Sm70UnquantizedMoEConfig
+    )
+    """Shared policy for native/Triton unquantized execution and its warmup."""
 
     awq: Sm70MoEFormatConfig = Field(default_factory=Sm70MoEFormatConfig)
     """AWQ options, captured only if an AWQ MoE layer is initialized."""
@@ -519,9 +682,13 @@ class Sm70MoEConfig:
     mxfp4: Sm70MxFp4MoEConfig = Field(default_factory=Sm70MxFp4MoEConfig)
     """MXFP4 options captured only when a native MXFP4 layer initializes."""
 
+    def capture_inputs(self) -> None:
+        for family in ("awq", "fp8", "nvfp4", "mxfp4"):
+            getattr(self, family).capture_inputs(family)
+
     @property
     def resolved(self) -> bool:
-        return any(
+        return bool(self.unquantized.sources or self.routing.sources) or any(
             getattr(self, family).resolved
             for family in ("awq", "fp8", "nvfp4", "mxfp4")
         )
@@ -529,9 +696,21 @@ class Sm70MoEConfig:
     def compute_hash(self) -> str:
         return hash_factors(
             {
-                family: getattr(self, family).hash_options()
-                for family in ("awq", "fp8", "nvfp4", "mxfp4")
-                if getattr(self, family).resolved
+                **{
+                    family: getattr(self, family).hash_options()
+                    for family in ("awq", "fp8", "nvfp4", "mxfp4")
+                    if getattr(self, family).resolved
+                },
+                **(
+                    {"routing": self.routing.compute_hash()}
+                    if self.routing.active and self.routing.sources
+                    else {}
+                ),
+                **(
+                    {"unquantized": self.unquantized.compute_hash()}
+                    if self.unquantized.active and self.unquantized.sources
+                    else {}
+                ),
             }
         )
 
@@ -563,3 +742,19 @@ def capture_mxfp4_moe_config() -> Sm70MxFp4MoEConfig:
     policy = cfg.kernel_config.sm70_moe.mxfp4 if cfg else Sm70MxFp4MoEConfig()
     policy.resolve()
     return policy
+
+
+def unquantized_moe_policy(cfg=None) -> Sm70UnquantizedMoEConfig:
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "kernel_config.sm70_moe.unquantized", Sm70UnquantizedMoEConfig, cfg
+    )
+
+
+def moe_routing_policy(cfg=None) -> Sm70MoERoutingPolicy:
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "kernel_config.sm70_moe.routing", Sm70MoERoutingPolicy, cfg
+    )

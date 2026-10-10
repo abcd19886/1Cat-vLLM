@@ -24,6 +24,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.config.execution_policy import layer_policy, ple_policy
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -117,6 +118,33 @@ _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
+_PLE_DIAGNOSTIC_BUFFERS: dict[str, torch.Tensor] = {}
+
+
+def _ple_diagnostic_snapshot(tensor: torch.Tensor, label: str) -> torch.Tensor:
+    # Return an owned clone: an unannotated custom-op output cannot alias its
+    # input. The retained copy is diagnostic-only, outside speed comparisons.
+    output = tensor.clone()
+    if tensor.shape[0] == 5:
+        if label not in _PLE_DIAGNOSTIC_BUFFERS:
+            _PLE_DIAGNOSTIC_BUFFERS[label] = torch.empty_like(output)
+        _PLE_DIAGNOSTIC_BUFFERS[label].copy_(output)
+    return output
+
+
+direct_register_custom_op(
+    "qwen4_exp_ple_diagnostic_snapshot",
+    _ple_diagnostic_snapshot,
+    fake_impl=lambda tensor, label: torch.empty_like(tensor),
+)
+
+
+def snapshot_ple_diagnostic(
+    tensor: torch.Tensor, label: str, enabled: bool
+) -> torch.Tensor:
+    if enabled and tensor.is_cuda:
+        return torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(tensor, label)
+    return tensor
 
 
 def _advise_random_file_access(tensor: torch.Tensor) -> str:
@@ -768,7 +796,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cascade = ple_cascade_configured()
         from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
 
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned_decode_active()
+        hybrid = ple_policy().hybrid or pinned_decode_active()
         spill = None
         if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
@@ -1142,7 +1170,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         self._remote_placements: list[PLERemotePlacement] = []
         self._disk_segments: list[PLEDiskSegment] = []
-        self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
+        self._disk_offload = bool(ple_policy().disk and is_offload_process())
         # The cascade worker keeps the checkpoint shards file-backed like the
         # disk lane: it serves only the rows the ranks do not hold and copies
         # none of the table into anonymous host memory.
@@ -1781,6 +1809,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 ngram_ids,
                 self.layer_name,
             )
+        ngram_ids = snapshot_ple_diagnostic(
+            ngram_ids,
+            self.layer_name + ":02_ngram_ids",
+            getattr(self, "_sm70_hcx_diagnostics", False),
+        )
         if output_buffer is not None:
             output = output_buffer[:num_tokens, : self.embedding_dim]
             # Cross-process FP8 results travel as raw bytes. Keeping the IPC
@@ -1845,7 +1878,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # in that process.
         if (
             ple_offload_enabled()
-            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not ple_policy().hybrid
             and not self.offload_keeps_local_tables()
             and not is_offload_process()
         ):
@@ -2057,6 +2090,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
+        self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics
+        self.ple_embedding._sm70_hcx_diagnostics = self._sm70_hcx_diagnostics
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -2456,7 +2491,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
         if (
-            envs.VLLM_SM70_MTP_PLE_CONV
+            layer_policy().value("ple_spec_conv")
             and num_reqs == 1
             and spec_query_len == 5
             and self.conv_state_len == 9
@@ -2774,7 +2809,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
+        input_ids = snapshot_ple_diagnostic(
+            input_ids, self.prefix + ":02_input_ids", diagnostic
+        )
         if input_ids.shape[0] != hidden_states.shape[0]:
             raise ValueError(
                 "PLE expects input_ids and hidden_states to have the same "
@@ -2787,23 +2826,38 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             query_start_loc,
             ngram_context,
         )
+        embeddings = snapshot_ple_diagnostic(
+            embeddings, self.prefix + ":02_embeddings", diagnostic
+        )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
+        key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
+        value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
         key = self._apply_norm(self.norm_key, key)
         query = self._apply_norm(self.norm_query, query)
+        key = snapshot_ple_diagnostic(key, self.prefix + ":05_key_norm", diagnostic)
+        query = snapshot_ple_diagnostic(
+            query, self.prefix + ":06_query_norm", diagnostic
+        )
         gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+        normalized = snapshot_ple_diagnostic(
+            normalized, self.prefix + ":07_conv_input", diagnostic
+        )
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
             conv_output,
             self.prefix,
+        )
+        conv_output = snapshot_ple_diagnostic(
+            conv_output, self.prefix + ":08_conv_output", diagnostic
         )
         return gated_value.flatten(-2) + conv_output
 

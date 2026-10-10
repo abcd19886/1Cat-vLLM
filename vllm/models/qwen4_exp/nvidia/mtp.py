@@ -19,10 +19,10 @@ import regex as re
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
+from vllm.config.execution_policy import graph_policy
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -526,7 +526,7 @@ class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
 @support_torch_compile(
     # As on the target, selection between the two compiled backbones must
     # remain outside the first, prefill-specialized compiled wrapper.
-    enable_if=lambda cfg: not envs.VLLM_SM70_QWEN38_DUAL_COMPILE,
+    enable_if=lambda cfg: not graph_policy().dual_compile,
     dynamic_arg_dims={
         "input_ids": 0,
         "positions": -1,
@@ -609,12 +609,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         if self._sm70_draft_head is None:
             from .sm70_mtp_head import prepare_mtp_qpn8_head
 
-            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
+            self._sm70_draft_head = prepare_mtp_qpn8_head(
+                self.lm_head, self.vllm_config.kernel_config.sm70_draft_hot_vocab
+            )
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         # Retain the fallback for callers that do not use the Eagle loader.
         self.prepare_sm70_draft_head()
-        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+        if not graph_policy(self.vllm_config).dual_compile:
             return False
         if self._sm70_decode_graph_model is None:
             decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
@@ -642,7 +644,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         backbone = self.model
-        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+        if graph_policy().dual_compile and is_sm70_decode_graph_compiling():
             backbone = self._sm70_decode_graph_model
             if backbone is None:
                 raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")

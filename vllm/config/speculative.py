@@ -14,6 +14,7 @@ from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -369,8 +370,30 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sampling_policy: SpeculativeSamplingPolicy = Field(
+        default_factory=SpeculativeSamplingPolicy
+    )
+    """Per-engine proposal/rejection policy captured before worker transfer."""
+
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
+    def resolve_execution_policy(self) -> None:
+        """Bind sampling and enabled assistance before worker serialization."""
+        self.sampling_policy.resolve(
+            draft=self.draft_sample_method == "probabilistic",
+            vocab=True,
+            vocab_default=self.method == "mtp",
+        )
+        self.sm70_dflash2.resolve_lookup(self)
+
+    diagnostic_confidence_logits: bool = Field(default=False, init=False)
+    """Bound extra confidence output contract; only affects DSpark compilation."""
+
+    def bind_diagnostic_output(self, alignment: bool | None) -> None:
+        self.diagnostic_confidence_logits = self.method == "dspark" and bool(
+            self.dspark_confidence_threshold > 0.0 or alignment
+        )
 
     def compute_hash(self) -> str:
         """
@@ -387,10 +410,25 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        if self.method == "dspark":
+            factors.append(
+                ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
+            )
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
             factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        if self.sampling_policy.sources:
+            factors.append(
+                (
+                    "sampling_policy",
+                    self.sampling_policy.compute_hash(
+                        draft=self.draft_sample_method == "probabilistic",
+                        vocab=self.method == "mtp",
+                        aux_hidden=self.use_dflash_family(),
+                    ),
+                )
+            )
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -1123,7 +1161,12 @@ class SpeculativeConfig:
 
         pp_size = self.target_parallel_config.pipeline_parallel_size
         num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        last_start, last_end = get_pp_indices(
+            num_layers,
+            pp_size - 1,
+            pp_size,
+            partition=self.target_parallel_config.communication.pp_layer_partition,
+        )
         layer_ids = tuple(
             getattr(
                 self.draft_model_config.hf_config,
