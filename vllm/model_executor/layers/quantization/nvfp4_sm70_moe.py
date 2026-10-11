@@ -10,14 +10,16 @@ expert-weight copy.
 
 from __future__ import annotations
 
-import os
 from typing import Final
 
 import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
+from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_moe import Sm70NvFp4MoEConfig, capture_nvfp4_moe_config
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -68,16 +70,10 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_NVFP4_TRACE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
-)
-_DFLASH_NVFP4_TRACE_ARMED = False
-
 
 def arm_dflash_nvfp4_trace() -> None:
-    global _DFLASH_NVFP4_TRACE_ARMED
-    if _DEBUG_DFLASH_NVFP4_TRACE:
-        _DFLASH_NVFP4_TRACE_ARMED = True
+    if capture_runtime_trace().dflash.value("target_layer_trace"):
+        diagnostic_history("nvfp4_dflash")["armed"] = True
 
 
 _SUPPORTED_CONTRACTS: Final = {
@@ -662,6 +658,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     ) -> None:
         FusedMoEMethodBase.__init__(self, moe_config)
         self.sm70_moe_policy = capture_nvfp4_moe_config()
+        self.native_ops = NativeBindings(self.sm70_moe_policy.native.values)
         if quant_config.quant_method not in {"NVFP4", "W4A16_NVFP4"}:
             raise NotImplementedError(
                 "SM70 TurboMind ModelOpt NVFP4 MoE requires NVFP4-family "
@@ -688,8 +685,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         layer.sm70_moe_policy = self.sm70_moe_policy
         layer.sm70_nvfp4_batch_capabilities = {
-            "w13": sm70_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch(),
-            "w2": sm70_ops.has_nvfp4_qpn_w2_reduce_dispatch(),
+            "w13": self.native_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch(),
+            "w2": self.native_ops.has_nvfp4_qpn_w2_reduce_dispatch(),
         }
         required_ops = (
             "nvfp4_sm70_prepare",
@@ -699,10 +696,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if (
             _nvfp4_policy(layer).qpn_m1 or _nvfp4_policy(layer).qpn_batch
-        ) and not sm70_ops.has_nvfp4_qpn_m1_dispatch():
+        ) and not self.native_ops.has_nvfp4_qpn_m1_dispatch():
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
         w2_direct_reduce_requested = bool(_nvfp4_policy(layer).w2_direct_reduce)
-        w2_direct_reduce_available = sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+        w2_direct_reduce_available = self.native_ops.has_nvfp4_qwen38_w2_direct_reduce()
         w2_direct_reduce_explicit = (
             "w2_direct_reduce" in _nvfp4_policy(layer).explicit_fields
         )
@@ -718,7 +715,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "the loaded extension; retaining separate W2 and weighted "
                 "reduce kernels. Explicit opt-in fails closed."
             )
-        if _nvfp4_policy(layer).qpn_mtp5 and not sm70_ops.has_nvfp4_qpn_mtp5_dispatch():
+        if (
+            _nvfp4_policy(layer).qpn_mtp5
+            and not self.native_ops.has_nvfp4_qpn_mtp5_dispatch()
+        ):
             missing.append("nvfp4_moe_qpn_mtp5_sm70_out")
         indexed_prefill_ops = {
             "nvfp4_moe_indexed_dense_stage_sm70_out": hasattr(
@@ -813,7 +813,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         fused_swiglu_decode = bool(
             _nvfp4_policy(layer).qpn_m1
             and fused_swiglu_prefill
-            and sm70_ops.has_nvfp4_qwen38_w13_fused_swiglu()
+            and self.native_ops.has_nvfp4_qwen38_w13_fused_swiglu()
         )
         if (
             _nvfp4_policy(layer).qpn_m1
@@ -833,7 +833,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and intermediate == 160
             and int(layer.moe_config.experts_per_token) == 10
         )
-        raw_scale_available = sm70_ops.has_nvfp4_qpn_raw_scale_dispatch()
+        raw_scale_available = self.native_ops.has_nvfp4_qpn_raw_scale_dispatch()
         raw_scale_explicit = "raw_scale" in _nvfp4_policy(layer).explicit_fields
         if raw_scale_requested and not raw_scale_available and raw_scale_explicit:
             raise RuntimeError(
@@ -1032,14 +1032,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         w13_q_ld = int(w13_meta[0][1].item())
         w2_k_ld = int(w2_meta[0][0].item())
         w2_q_ld = int(w2_meta[0][1].item())
-        w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
             w13_k_ld,
             w13_q_ld,
             num_experts,
         )
-        w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w2_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
             w2_k_ld,
@@ -1053,14 +1053,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             # N320 view, so both subprojections retain the original q_ld.
             w13_flat = layer.w13_tm_weight.view(num_experts, -1)
             head_words = hidden * 256 // 8
-            w13_head_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+            w13_head_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
                 w13_flat[:, :head_words],
                 layer.w13_tm_scales[:, :, :256],
                 w13_k_ld,
                 w13_q_ld,
                 num_experts,
             )
-            w13_tail_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+            w13_tail_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
                 w13_flat[:, head_words:],
                 layer.w13_tm_scales[:, :, 256:],
                 w13_k_ld,
@@ -1125,8 +1125,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and grouped_supported
         )
         if (grouped_requested or grouped_mtp5) and (
-            not sm70_ops.has_nvfp4_grouped_decode_dispatch()
-            or (grouped_mtp5 and not sm70_ops.has_nvfp4_grouped_batch_reduce_dispatch())
+            not self.native_ops.has_nvfp4_grouped_decode_dispatch()
+            or (
+                grouped_mtp5
+                and not self.native_ops.has_nvfp4_grouped_batch_reduce_dispatch()
+            )
         ):
             raise RuntimeError(
                 "SM70 grouped MoE decode requires a matching native build."
@@ -1155,6 +1158,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             LayerWorkspaceView(layer, "sm70_nvfp4_"),
             raw_scale=bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False)),
             swiglu_limit=getattr(layer, "swiglu_limit", None),
+            bindings=self.native_ops,
         )
         self._allocate_graph_safe_decode_buffers(layer)
 
@@ -1394,7 +1398,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = top_k
         elif glm53_fused_permute_q8:
-            sm70_ops.sm70_glm53_moe_permute_q8_out(
+            self.native_ops.sm70_glm53_moe_permute_q8_out(
                 x,
                 topk_ids,
                 buffers["permuted_input"],
@@ -1412,7 +1416,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             topk_ids_i32.copy_(topk_ids, non_blocking=True)
             buffers["permuted_idx"].fill_(slots)
             if indexed_w13:
-                torch.ops._moe_C.moe_permute_metadata_with_scratch(
+                self.native_ops.moe_permute_metadata_with_scratch(
                     x,
                     topk_ids_i32,
                     buffers["token_expert_indices"],
@@ -1430,7 +1434,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     buffers["topk_ids_for_sort"],
                 )
             else:
-                torch.ops._moe_C.moe_permute_with_scratch(
+                self.native_ops.moe_permute_with_scratch(
                     x,
                     topk_ids_i32,
                     buffers["token_expert_indices"],
@@ -1520,9 +1524,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             if glm53_fused_permute_q8
             else buffers["expert_offsets64"],
         )
-        global _DFLASH_NVFP4_TRACE_ARMED
-        if _DFLASH_NVFP4_TRACE_ARMED and num_tokens > 1:
-            _DFLASH_NVFP4_TRACE_ARMED = False
+        if diagnostic_history("nvfp4_dflash").get("armed", False) and num_tokens > 1:
+            diagnostic_history("nvfp4_dflash")["armed"] = False
             actual = output.clone()
             reference_rows = []
             for token_idx in range(num_tokens):

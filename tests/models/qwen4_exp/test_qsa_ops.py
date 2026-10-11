@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
@@ -162,8 +163,8 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((1,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", rows)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", rows)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -190,7 +191,7 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
         query_positions[:-1],
         sequence_lengths,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
 
 
@@ -266,8 +267,8 @@ def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((4,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 4096)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -312,7 +313,7 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         "flash_attn_v100.flash_attn_interface",
         flash_interface,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
 
     calls = []
 
@@ -462,8 +463,8 @@ def test_qsa_xqa_page4_table_rejects_stale_or_invalid_tail_metadata():
 def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
     cache = torch.empty(2, 400, 1, 128, dtype=torch.float16)
     page_table = torch.empty(1, 2, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS_MIN_ROWS", 256)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", True)
+    set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 256)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -479,11 +480,7 @@ def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
 
 
 def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
-    monkeypatch.setattr(
-        qsa_ops,
-        "_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
-        1024**2,
-    )
+    set_qsa_option(monkeypatch, "qsa_cublas_min_score_elements", 1024**2)
 
     assert not qsa_ops._qsa_indexer_cublas_work_supported(1024, 512)
     assert qsa_ops._qsa_indexer_cublas_work_supported(2048, 512)
@@ -523,3 +520,63 @@ def test_qsa_lexicographic_topk_prefers_validation_sidecar(monkeypatch):
 
     qsa_ops.torch.ops._C_qsa_sm70 = SimpleNamespace()
     assert _sm70_qsa_lexicographic_topk_op() is wheel
+
+
+@pytest.mark.parametrize("exact", (False, True))
+def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, exact):
+    """The generic selector owns one reusable scratch; exact selection needs none."""
+    rows, columns = 5, 16
+    q = torch.empty(rows, 4, 128)
+    output = torch.empty(rows, 2051, dtype=torch.int32)
+    events = []
+    scratch = []
+    allocate = torch.empty
+
+    def record_allocation(shape, **kwargs):
+        tensor = allocate(shape, **kwargs)
+        if kwargs.get("dtype") == torch.uint8:
+            scratch.append(tensor)
+        return tensor
+
+    def score(query, *args, **kwargs):
+        events.append("score")
+        n = query.shape[0]
+        return torch.ones(n, columns), torch.full((n,), columns, dtype=torch.int32)
+
+    def select(logits, lengths, indices, *args):
+        events.append("select")
+        if not exact:
+            assert args[0] is scratch[0]
+            assert args[0].numel() == qsa_ops._TOPK_WORKSPACE_BYTES
+        indices.zero_()
+
+    def expand(*args):
+        events.append("expand")
+        args[-1].fill_(-1)
+
+    monkeypatch.setattr(torch, "empty", record_allocation)
+    monkeypatch.setattr(qsa_ops, "_LOGITS_WORKSPACE_BYTES", 2 * columns * 4)
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_indexer_cublas", lambda *a: False)
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_lexicographic_topk", lambda *a: exact)
+    monkeypatch.setattr(qsa_ops, "_sm70_qsa_lexicographic_topk_op", lambda: select)
+    monkeypatch.setattr(
+        qsa_ops.current_platform, "has_device_capability", lambda *a: False
+    )
+    monkeypatch.setattr(qsa_ops, "qsa_mqa_paged", score)
+    monkeypatch.setattr(qsa_ops.torch.ops._C, "persistent_topk", select, raising=False)
+    monkeypatch.setattr(qsa_ops, "expand_qsa_block_indices_cuda", expand)
+    actual = qsa_ops.qsa_select_paged_tokens(
+        q,
+        torch.ones(1, columns, 1, 128),
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.arange(rows),
+        torch.tensor([columns * 4], dtype=torch.int32),
+        2048,
+        4,
+        output,
+    )
+    assert actual is output
+    assert torch.all(output == -1)
+    assert len(scratch) == (0 if exact else 1)
+    assert events == ["score", "select", "expand"] * 3

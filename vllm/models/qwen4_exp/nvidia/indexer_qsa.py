@@ -129,6 +129,7 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
         self.skip_topk = False
+        self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -195,8 +196,13 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        select: bool = True,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Return fixed-width request-relative token indices padded with ``-1``.
+
+        ``select=False`` still writes the raw and compressed key caches but skips
+        scoring and top-k; the caller attends densely.
+        """
 
         metadata = self._metadata()
         if metadata is None:
@@ -226,7 +232,11 @@ class QSAIndexer(nn.Module):
         positions = positions[..., :num_tokens]
 
         # Q/K projection
-        projected_qk, _ = self.index_qk_proj(hidden_states)
+        if hidden_states.shape[-1] != self.index_qk_proj.input_size:
+            # Already projected inside the fused SM70 qkv launch.
+            projected_qk = hidden_states
+        else:
+            projected_qk, _ = self.index_qk_proj(hidden_states)
         projected_q, raw_keys = projected_qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -333,7 +343,7 @@ class QSAIndexer(nn.Module):
                     position_rows,
                 )
 
-        if self.skip_topk:
+        if self.skip_topk or not select:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
@@ -350,6 +360,7 @@ class QSAIndexer(nn.Module):
             self.compress_ratio,
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
+            shared_key_scoring=self.shared_key_scoring,
         )
 
 

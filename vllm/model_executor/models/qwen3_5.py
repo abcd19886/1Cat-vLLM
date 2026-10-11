@@ -30,7 +30,6 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -231,8 +230,11 @@ def _sm70_materialize_qwen35_gdn_splits(
     return z, b, a
 
 
-def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
-    raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
+def _parse_sm70_moe_dense_allowlist(policy=None) -> set[str] | None:
+    from vllm.config.execution_policy import layer_policy
+
+    policy = layer_policy() if policy is None else policy
+    raw = policy.moe_dense_allowlist
     if raw is None:
         return None
     suffixes = {item.strip() for item in raw.split(",") if item.strip()}
@@ -540,7 +542,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
         )
-        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+        if self.gdn_policy.projection.mixed_qkv_contiguous:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
@@ -1122,14 +1124,16 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         # Qwen3.5 MoE variants have not accepted the generic dense FP16
         # TurboMind path for all projections. Keep the 0.0.3 safety default:
         # forbid it unless an explicit MoE-only suffix allowlist is provided.
-        allowlist = _parse_sm70_moe_dense_allowlist()
+        allowlist = _parse_sm70_moe_dense_allowlist(
+            vllm_config.kernel_config.layer_execution
+        )
         for module in self.modules():
             module._sm70_f16_forbidden = True
             if allowlist:
                 module_prefix = getattr(module, "prefix", "")
                 if module_prefix and module_prefix.rsplit(".", 1)[-1] in allowlist:
                     module._sm70_f16_forbidden = False
-        if envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH or allowlist is not None:
+        if vllm_config.kernel_config.layer_execution.dense_f16 or allowlist is not None:
             logger.info_once(
                 "SM70 dense fp16 fast path is disabled for Qwen3.5 MoE "
                 "modules except VLLM_SM70_MOE_DENSE_ALLOWLIST=%s.",

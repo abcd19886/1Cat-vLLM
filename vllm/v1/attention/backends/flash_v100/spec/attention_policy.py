@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -25,17 +26,17 @@ def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
 
     if (
         use_e4m3_fp32
-        and _config.registered("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS")
+        and _config.options().value("tail_cudagraphs")
         and (
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST")
+            _config.options().value("scalar_tail_manifest")
             or scalar_tail_attention_available()
         )
-        and not _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+        and not graph_policy().decode_partition_size
     ):
         # An empty name selects the operator compiled into this extension;
         # a manifest name keeps the explicit experimental override.
         self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST") or "",
+            _config.options().value("scalar_tail_manifest") or "",
             torch.device("cuda", torch.accelerator.current_device_index()),
         )
 
@@ -74,15 +75,15 @@ def configure_prefill(self: Any) -> None:
 def configure_verifier(self: Any) -> None:
     self.use_dflash2_grouped_verify = (
         self.flash_attn_grouped_verify_paged is not None
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY")
+        and flash_v100_policy().grouped_verify
         and current_platform.is_device_capability(70)
     )
     self.use_dflash2_batched_grouped_verify = (
         self.use_dflash2_grouped_verify
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY")
+        and _config.options().value("dflash2_batched_grouped_verify")
     )
-    self.dflash2_grouped_verify_min_model_len = _config.registered(
-        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
+    self.dflash2_grouped_verify_min_model_len = (
+        flash_v100_policy().grouped_verify_min_model_len
     )
     if self.dflash2_grouped_verify_min_model_len < 1:
         raise ValueError(
