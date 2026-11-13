@@ -17,7 +17,7 @@ import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.common.ple as ple_common
 import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
 from tests.utils import set_lazy_env
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
@@ -884,6 +884,9 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # to record the admission in.
     module._kernel_config = None
     module._disk_row_gather = True
+    module._disk_prefetch_window_bytes = (
+        KernelConfig().ple_disk_prefetch_window_kib << 10
+    )
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -1770,6 +1773,14 @@ def test_ngram_embedding_cascade_worker_keeps_shards_file_backed(
     assert layer.get_offload_output_dtype(torch.float16) == torch.uint8
 
 
+def test_cascade_worker_prefaults_actual_disk_rows(monkeypatch) -> None:
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    placement = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=64)
+    layer.bind_remote_placements([placement])
+    assert layer._disk_segments
+    assert layer.needs_weight_prefault()
+
+
 def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1783,10 +1794,12 @@ def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     with pytest.raises(TypeError, match="PLERemotePlacement"):
         layer.bind_remote_placements([object()])
 
+    assert layer.needs_weight_prefault()
     resident = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128)
     layer.bind_remote_placements([resident])
     assert layer._remote_placements == [resident]
     assert layer._disk_segments == []
+    assert not layer.needs_weight_prefault()
 
     input_ids = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)

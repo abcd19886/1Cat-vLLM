@@ -66,7 +66,10 @@ Startup requires at least 21 GiB of available host memory before loading.
 the shared offload process. The cache stores original bytes, so misses and hits
 use the same official dequantization. Direct-mapped collisions replace cache
 entries without changing requested output order. Allocation is lazy; selected
-cold pages are prefetched rather than faulting the entire table into RAM.
+cold pages are prefetched rather than faulting the entire table into RAM. The
+mapped row reader copies a request's rows in address order and prefetches only
+`ple_disk_prefetch_window_kib` ahead of the copy, so reclaim under memory
+pressure does not drop read-ahead pages before they are copied.
 The profile uses a 512 MiB total CPU budget and an 8192-token GPU KV hot cache.
 
 ## Validation status
@@ -360,3 +363,19 @@ FP16 and Q4_K graphs with independent pools: native workspace storage decreased
 from 50 MiB to 20 MiB including the unchanged tuning stream. Changed-input
 outputs remained bitwise identical. Four GPU tests passed. This establishes
 stream-workspace savings, not an end-to-end latency or capacity result.
+
+The next target graph completed; draft sampling failed in its shared Q6_K head
+instead. Prepared projections called their opaque native operator without
+borrowing the prepared engine owner outside model forward. This requested the
+process-default 32 MiB scratch despite the engine's 8 MiB budget. Bind single
+and mixed projection calls through the existing native resource owner. Mixed
+projections from different owners keep individual dispatch. No weight format
+or arithmetic changes. The allocator cleanup released zero bytes in this
+full-model run; its isolated saving did not improve full-model capacity.
+
+An isolated real rank-zero Q6_K head (62080 by 2560) passed M1/M5/M20:
+relative L2 error against official FP32 dequantization was 0.0334–0.0347%,
+changed-input graph outputs were bitwise identical, and process-default
+native storage did not grow. The prepared owner used its 8 MiB budget.
+Three decoder families also passed six single/mixed projection GPU cases.
+These are operator checks; full-model startup and latency remain pending.

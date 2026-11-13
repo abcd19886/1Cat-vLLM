@@ -33,11 +33,15 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.draft_vocab import DraftVocab, make_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    get_target_lm_head,
+    load_eagle_model,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import TargetSamplingHooks
 
 logger = init_logger(__name__)
@@ -134,6 +138,10 @@ class EagleSpeculator(TargetSamplingHooks):
         self.arange = torch.arange(
             self.max_num_reqs + 1, dtype=torch.int32, device="cpu"
         )
+        self._draft_seq_lens_max_cpu = torch.full(
+            (self.max_num_reqs,), self.max_model_len, dtype=torch.int32
+        )
+        self._draft_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.draft_model_config
@@ -228,6 +236,7 @@ class EagleSpeculator(TargetSamplingHooks):
         ).keys()
 
         self.model = load_eagle_model(target_model, self.vllm_config)
+        self.draft_vocab = self._maybe_make_draft_vocab(target_model)
         self._validate_local_argmax_reduction()
         # A target that keeps the drafter's input hidden state in a persistent
         # buffer of the same shape (e.g. HC multi-stream MTP input) is read in
@@ -294,12 +303,13 @@ class EagleSpeculator(TargetSamplingHooks):
             return ()
 
         text_config = self.draft_model_config.hf_text_config
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if not (
             self.draft_model_config.get_num_experts() == 512
             and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
             and self.draft_model_config.get_hidden_size() == 2560
             and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
-            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+            and tp_size in (1, 2, 4)
         ):
             return ()
         self._sm70_mtp_moe_warmed = True
@@ -438,6 +448,26 @@ class EagleSpeculator(TargetSamplingHooks):
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
+    def _maybe_make_draft_vocab(self, target_model: nn.Module) -> DraftVocab | None:
+        token_map = self.speculative_config.draft_token_map
+        if token_map is None:
+            return None
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_lm_head = get_target_lm_head(target_model, target_language_model)
+        if target_lm_head is None:
+            raise ValueError("draft_token_map requires the target lm_head.")
+        return make_draft_vocab(
+            token_map,
+            self.vllm_config.model_config,
+            self.model,
+            target_lm_head,
+            self.speculative_config.draft_token_map_sha256,
+        )
+
     def _sample_draft(
         self,
         hidden_states: torch.Tensor,
@@ -446,8 +476,14 @@ class EagleSpeculator(TargetSamplingHooks):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        draft_vocab = self.draft_vocab
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
+            if draft_vocab is not None:
+                # Rejection sampling reads the proposal over the full vocab.
+                logits = draft_vocab.scatter(
+                    draft_vocab.restrict(logits), self.vocab_size
+                )
             # This drafter's position contract keys the proposed token at pos + 1.
             return gumbel_sample(
                 logits,
@@ -462,9 +498,12 @@ class EagleSpeculator(TargetSamplingHooks):
                 use_fp64=self.use_fp64_gumbel,
             )
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            top = self.model.get_top_tokens(hidden_states)
+            return top if draft_vocab is None else draft_vocab.col_to_target[top]
         logits = self.model.compute_logits(hidden_states)
-        return logits.argmax(dim=-1)
+        if draft_vocab is None:
+            return logits.argmax(dim=-1)
+        return draft_vocab.target_ids[draft_vocab.restrict(logits).argmax(dim=-1)]
 
     def _mtp_prefill_begin(self) -> None:
         if self.share_mtp_topk_indices:
@@ -675,6 +714,19 @@ class EagleSpeculator(TargetSamplingHooks):
         query_start_loc_cpu = torch.clamp(
             self.arange[: num_reqs_padded + 1], max=num_reqs
         )
+        upper = getattr(self, "_draft_seq_lens_cpu_upper_bound", None)
+        if upper is None or upper.numel() < num_reqs:
+            # Capture and dummy runs: the longest sequence any request can reach.
+            upper = self._draft_seq_lens_max_cpu[:num_reqs_padded]
+        elif upper.numel() < num_reqs_padded:
+            upper = torch.cat(
+                [
+                    upper[:num_reqs],
+                    self._draft_seq_lens_max_cpu[num_reqs:num_reqs_padded],
+                ]
+            )
+        else:
+            upper = upper[:num_reqs_padded]
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
@@ -693,6 +745,7 @@ class EagleSpeculator(TargetSamplingHooks):
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=upper,
         )
         return attn_metadata
 
@@ -798,6 +851,16 @@ class EagleSpeculator(TargetSamplingHooks):
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
+        # Draft steps advance each request by at most num_speculative_steps
+        # positions past the target step. A CPU upper bound lets the attention
+        # builders pick their routes without a device-to-host seq_lens sync,
+        # which stalled every draft step and broke single-graph capture.
+        upper = getattr(input_batch, "seq_lens_cpu_upper_bound", None)
+        self._draft_seq_lens_cpu_upper_bound = (
+            torch.clamp(upper + self.num_speculative_steps, max=self.max_model_len)
+            if isinstance(upper, torch.Tensor)
+            else None
+        )
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and

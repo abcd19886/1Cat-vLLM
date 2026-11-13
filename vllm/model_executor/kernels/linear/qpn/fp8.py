@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 
 from vllm import _sm70_ops as sm70_ops
-from vllm._sm70.policy import NativeBindings
+from vllm._sm70.policy import NativeBindings, call_native
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.logger import init_logger
@@ -35,6 +35,12 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _SM70_FP8_PREFILL_DENSE_MIN_M = 3920
+# Grouped BMMs (DeepSeek-V4 wo_a) run as one TurboMind grouped GEMM up to this
+# many tokens per group, the decode and speculative verification sizes; one
+# launch per group reads each group's weights with a GEMM tile sized for
+# prefill (V100, 8 groups of 1024 x 4096 at 6 tokens: eight launches 195 µs,
+# one grouped launch 125 µs, 51 µs with the small-shape tuning).
+SM70_FP8_GROUPED_DECODE_MAX_TOKENS = 16
 _SM70_FP8_EXACT_8K_PREFILL_M = 8000
 _SM70_FP8_EXACT_8K_PREFILL_SHAPES = {
     "in_proj_qkvz": (5120, 4096),
@@ -100,6 +106,20 @@ _SM70_FP8_QPN8_REQUIRED_OPS = (
 # Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
 _sm70_fp8_prefill_dense_workspaces: dict[tuple, torch.Tensor] = {}
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+def has_block_qpn8_codes(layer: torch.nn.Module) -> bool:
+    return hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+
+
+def layer_supports_direct_output(layer: torch.nn.Module) -> bool:
+    return bool(
+        (
+            getattr(layer, "sm70_fp8_qpn8", False)
+            and not getattr(layer, "sm70_fp8_qpn8_bmm", False)
+        )
+        or has_block_qpn8_codes(layer)
+    )
 
 
 def clear_sm70_fp8_workspaces() -> None:
@@ -317,11 +337,14 @@ def _missing_sm70_fp8_qpn8_ops() -> list[str]:
 
 def _get_sm70_fp8_prefill_exact_dense_workspace(
     weight: torch.Tensor,
+    min_elements: int = 0,
 ) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    elements = max(_SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel())
+    elements = max(
+        _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel(), min_elements
+    )
     # Never replace a live allocation: prepared layers retain its raw pointer.
     cache_key = (
         (device_index, torch.float16)
@@ -644,9 +667,6 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             layer.sm70_fp8_q_ld = int(first_meta[1].item())
             if (
                 self.policy.legacy_grouped_bmm_decode
-                and group_count == 2
-                and rows_per_group == 1024
-                and int(layer.weight.shape[1]) == 4096
                 and hasattr(
                     torch.ops._C,
                     "fp8_moe_gemm_sm70_per_expert_dispatch_out",
@@ -666,13 +686,19 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 layer.register_buffer(
                     "sm70_fp8_bmm_grouped_ptrs_s", ptrs_s, persistent=False
                 )
+                # Row m - 1: group offsets for m tokens per group.
+                tokens = torch.arange(
+                    1,
+                    SM70_FP8_GROUPED_DECODE_MAX_TOKENS + 1,
+                    dtype=torch.int32,
+                    device=layer.weight.device,
+                )
+                groups = torch.arange(
+                    group_count + 1, dtype=torch.int32, device=layer.weight.device
+                )
                 layer.register_buffer(
                     "sm70_fp8_bmm_grouped_offsets",
-                    torch.arange(
-                        group_count + 1,
-                        dtype=torch.int32,
-                        device=layer.weight.device,
-                    ),
+                    tokens[:, None] * groups[None, :],
                     persistent=False,
                 )
                 layer.sm70_fp8_bmm_grouped_decode = True
@@ -919,9 +945,21 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
         logger.info_once("SM70 FP8 TurboMind W8A16 dense path enabled.")
         return
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        return bool(
+            getattr(layer, "sm70_fp8_qpn8", False)
+            and not getattr(layer, "sm70_fp8_qpn8_bmm", False)
+        )
+
     def apply_weights(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None and not self.supports_direct_output(layer):
+            raise ValueError("Output buffers require the SM70 FP8 QPN8 route")
         if getattr(layer, "sm70_fp8_qpn8", False):
             if x.dtype != torch.float16:
                 raise RuntimeError(
@@ -969,12 +1007,25 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             x_2d = flatten_linear_input(x)
             if x_2d.stride(-1) != 1:
                 x_2d = x_2d.contiguous()
-            out_2d = torch.empty(
-                (x_2d.shape[0], layer.output_size_per_partition),
-                device=x.device,
-                dtype=x.dtype,
-            )
+            if output is not None:
+                expected_shape = (*x.shape[:-1], layer.output_size_per_partition)
+                if (
+                    output.shape != expected_shape
+                    or output.dtype != x.dtype
+                    or output.device != x.device
+                    or not output.is_contiguous()
+                ):
+                    raise ValueError("Invalid SM70 FP8 projection output buffer")
+                out_2d = output.reshape(x_2d.shape[0], layer.output_size_per_partition)
+            else:
+                out_2d = torch.empty(
+                    (x_2d.shape[0], layer.output_size_per_partition),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
             if x_2d.shape[0] == 0:
+                if output is not None:
+                    return output
                 return restore_linear_output(out_2d, x, layer.output_size_per_partition)
             torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                 out_2d,
@@ -987,10 +1038,11 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 bool(layer.sm70_fp8_qpn8_prefetch),
                 False,
             )
-            out = restore_linear_output(out_2d, x, layer.output_size_per_partition)
             if bias is not None:
-                out.add_(bias)
-            return out
+                out_2d.add_(bias)
+            if output is not None:
+                return output
+            return restore_linear_output(out_2d, x, layer.output_size_per_partition)
 
         if getattr(layer, "sm70_fp8_bmm", False):
             group_count = int(layer.sm70_fp8_bmm_groups)
@@ -1007,14 +1059,15 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 device=x.device,
                 dtype=x.dtype,
             )
+            tokens = x_grouped.shape[0]
             if (
                 getattr(layer, "sm70_fp8_bmm_grouped_decode", False)
-                and x_grouped.shape[0] == 1
+                and 0 < tokens <= SM70_FP8_GROUPED_DECODE_MAX_TOKENS
             ):
                 self.native_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                    out_by_group.reshape(group_count, output_size),
-                    x_by_group.reshape(group_count, x.shape[-1]),
-                    layer.sm70_fp8_bmm_grouped_offsets,
+                    out_by_group.reshape(group_count * tokens, output_size),
+                    x_by_group.reshape(group_count * tokens, x.shape[-1]),
+                    layer.sm70_fp8_bmm_grouped_offsets[tokens - 1],
                     layer.sm70_fp8_bmm_grouped_ptrs_w,
                     layer.sm70_fp8_bmm_grouped_ptrs_s,
                     group_count,
@@ -1259,3 +1312,62 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             and len(output_partition_sizes) == 2
             and output_partition_sizes[0] == output_partition_sizes[1]
         )
+
+
+_QPN8_ROW_BLOCK = 32
+_QPN8_ROW_BLOCKS_MAX = 4 * _QPN8_ROW_BLOCK
+_QPN8_NATIVE_ROWS_MAX = 40
+
+
+def dispatch_channel_rows(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+    native_policy: list[str] | None = None,
+) -> None:
+    # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
+    # integer from apply_weights embeds a process-local address in AOT artifacts.
+    # Weight preparation already reserves this shared, bounded workspace.
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is None:
+        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
+    rows = x.shape[0]
+    if _QPN8_NATIVE_ROWS_MAX < rows <= _QPN8_ROW_BLOCKS_MAX:
+        # Without the batch TurboMind copy, 41..128 rows would take the dense
+        # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
+        # traffic per weight). Up to four 32-row QPN8 launches read the FP8
+        # codes once each and give each row the same per-row arithmetic.
+        for begin in range(0, rows, _QPN8_ROW_BLOCK):
+            end = min(begin + _QPN8_ROW_BLOCK, rows)
+            call_native(
+                sm70_ops.fp8_qpn8_dispatch_sm70_out,
+                native_policy,
+                out[begin:end],
+                workspace.data_ptr(),
+                x[begin:end],
+                codes,
+                scales,
+                split_k,
+                accumulator_chains,
+                prefetch_codes,
+                gated_silu,
+            )
+        return
+    call_native(
+        sm70_ops.fp8_qpn8_dispatch_sm70_out,
+        native_policy,
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )

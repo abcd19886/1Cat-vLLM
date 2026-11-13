@@ -513,7 +513,8 @@ class CustomAllreduce:
             )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
-                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
+                "FP16 verifier messages through 640 KiB, 8-KiB decode, "
+                "and 5-KiB Qwen4Exp "
                 "payloads; batch payloads are %s, 5-KiB sum2 is %s, "
                 "and opt-in 25-KiB MTP4 is %s.",
                 qwen38_batch_status,
@@ -750,6 +751,47 @@ class CustomAllreduce:
             self._ptr, lora, weight, branches, output
         )
 
+    def can_all_reduce_gemma_rms_norm(self, inp, residual, weight) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size in (2, 4)
+            and residual.dtype == torch.float32
+            and self._native.has("all_reduce_gemma_rms_norm")
+            and self.capabilities.gemma_norm(
+                inp, residual, weight, world_size=self.world_size, long=False
+            )
+        )
+
+    def all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.can_all_reduce_gemma_rms_norm(inp, residual, weight):
+            raise RuntimeError("Ordered all-reduce RMSNorm is unavailable")
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual)
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered:
+            safe_inp = self._ipc_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
+        self._native.all_reduce_gemma_rms_norm(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            0 if registered else self.buffer_ptrs[self.rank],
+            0 if registered else self.max_size,
+            epsilon,
+        )
+        return normalized_out, residual_out
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,
@@ -799,7 +841,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fuse the eight-row push collective, residual add, and Gemma norm."""
+        """Fuse the verifier push collective, residual add, and Gemma norm."""
         if not self.can_sm70_tp4_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP4 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
@@ -831,8 +873,14 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
-        return not self.disabled and self.capabilities.gemma_norm(
-            inp, residual, weight, world_size=4, long=False
+        return (
+            not self.disabled
+            and self.capabilities.gemma_norm(
+                inp, residual, weight, world_size=4, long=False
+            )
+            and ops.custom_ar_verifier_norm_rows_supported(
+                self._native.namespace, inp.shape[0]
+            )
         )
 
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(

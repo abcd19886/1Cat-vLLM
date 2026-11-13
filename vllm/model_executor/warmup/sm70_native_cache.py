@@ -61,6 +61,22 @@ def _key(values):
     return hashlib.sha256(json.dumps(calculation).encode()).hexdigest()
 
 
+def has_matching_policy_cache(path: str) -> bool:
+    """Whether an explicit table covers every current calculation policy."""
+    policies = _policies()
+    if policies == ((),):
+        return False
+    partition_path = Path(path + ".policy-v1")
+    source = partition_path if partition_path.exists() else Path(path)
+    payload = source.read_bytes()
+    if not payload.startswith(_MAGIC):
+        return False
+    partitions = json.loads(payload[len(_MAGIC) :])
+    return isinstance(partitions, dict) and all(
+        _key(values) in partitions for values in policies
+    )
+
+
 def import_cache(device_hint, path: str) -> int:
     policies = _policies()
     partition_path = Path(path + ".policy-v1")
@@ -120,6 +136,14 @@ def export_cache(device_hint, path: str) -> int:
         _MAGIC + json.dumps(partitions, sort_keys=True).encode()
     )
     return records
+
+
+def freeze_tuning(device_hint) -> int:
+    """Make each policy partition's measured plan final on this device."""
+    return sum(
+        int(NativeBindings(values).sm70_gemm_freeze_tuning(device_hint))
+        for values in _policies()
+    )
 
 
 def packed_cache_bytes(path: Path) -> bytes:
