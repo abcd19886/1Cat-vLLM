@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -33,6 +34,7 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode import sm70_sparse_target as _sparse_target
 from vllm.v1.worker.gpu.spec_decode.draft_vocab import DraftVocab, make_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
@@ -271,6 +273,7 @@ class EagleSpeculator(TargetSamplingHooks):
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
         )
+        _sparse_target.maybe_warmup_sparse_target(self)
 
     def set_attn(
         self,
@@ -386,12 +389,20 @@ class EagleSpeculator(TargetSamplingHooks):
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
-            ret_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
+            # Models whose compiled draft forward must not enter a Python
+            # context (e.g. ContextVar.set under Dynamo) expose the context for
+            # this uncompiled caller instead.
+            draft_ctx = getattr(self.model, "draft_forward_context", None)
+            hc_ctx: AbstractContextManager[Any] = (
+                draft_ctx() if draft_ctx is not None else nullcontext()
             )
+            with hc_ctx:
+                ret_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    inputs_embeds=inputs_embeds,
+                )
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
         if isinstance(ret_hidden_states, tuple):
@@ -400,6 +411,12 @@ class EagleSpeculator(TargetSamplingHooks):
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
+
+    def capture_target_sampler(self, model: nn.Module, rejection_sampler) -> None:
+        if rejection_sampler is not None:
+            _sparse_target.maybe_capture_sparse_target_graphs(
+                self, model, rejection_sampler
+            )
 
     def try_sample_target(
         self,
@@ -411,23 +428,15 @@ class EagleSpeculator(TargetSamplingHooks):
         *,
         allow_graph: bool = True,
     ):
-        """Compact top-k target sampling for argmax drafts (SM70, opt-in)."""
-        if self.draft_logits is not None or not getattr(
-            self.vllm_config.kernel_config, "sm70_sparse_target_sampling", False
-        ):
-            return None
-        from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
-            try_greedy_draft_sparse_rejection,
-        )
-
-        ref_check = self.vllm_config.kernel_config.sm70_sparse_target_reference_check
-        return try_greedy_draft_sparse_rejection(
+        """Compact top-k target sampling for argmax drafts."""
+        return _sparse_target.maybe_sample_sparse_target(
+            self,
             model,
             rejection_sampler,
             hidden_states,
             input_batch,
             grammar_output,
-            reference_check=True if ref_check is None else bool(ref_check),
+            allow_graph=allow_graph,
         )
 
     def _validate_local_argmax_reduction(self) -> None:
@@ -564,10 +573,19 @@ class EagleSpeculator(TargetSamplingHooks):
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        active_spec_steps: int | None = None,
     ) -> None:
+        steps = (
+            self.num_speculative_steps
+            if active_spec_steps is None
+            else max(1, min(int(active_spec_steps), self.num_speculative_steps))
+        )
+        if steps <= 1:
+            return
         multistep = getattr(self, "multistep_cudagraph_manager", None)
         if (
-            multistep is not None
+            steps == self.num_speculative_steps
+            and multistep is not None
             and self.vllm_config.kernel_config.capture_all_draft_steps
             and batch_desc.cg_mode == CUDAGraphMode.FULL
             and batch_desc in multistep.graphs
@@ -579,7 +597,7 @@ class EagleSpeculator(TargetSamplingHooks):
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, steps):
             attn_metadata = None
             slot_mappings_by_layer = None
             if not skip_attn:
@@ -848,6 +866,7 @@ class EagleSpeculator(TargetSamplingHooks):
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        active_spec_steps: int | None = None,
     ) -> torch.Tensor:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -968,7 +987,7 @@ class EagleSpeculator(TargetSamplingHooks):
             need_eager=is_profile,
         )
 
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
+        # Generate the remaining draft tokens (trimmed by active_spec_steps if set).
         self._mtp_decode_begin()
         try:
             self.multi_step_decode(
@@ -976,6 +995,7 @@ class EagleSpeculator(TargetSamplingHooks):
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
+                active_spec_steps=active_spec_steps,
             )
         finally:
             self._mtp_decode_end()

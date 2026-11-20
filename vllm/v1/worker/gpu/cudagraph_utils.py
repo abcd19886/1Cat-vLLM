@@ -12,10 +12,14 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+from vllm.compilation.sm70_decode_graph import (
+    cudagraph_capture_stream_workspace_scope,
+    sm70_decode_graph_compilation,
+)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.execution_policy import graph_policy
+from vllm.config.kernel import is_adaptive_mtp_enabled
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -49,7 +53,8 @@ def _supports_sm70_long_batch_graphs(vllm_config: VllmConfig) -> bool:
     if (
         model is None
         or getattr(model, "dtype", None) != torch.float16
-        or getattr(cache, "cache_dtype", None) not in ("fp8", "fp8_e4m3")
+        or getattr(cache, "cache_dtype", None)
+        not in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
     ):
         return False
     parallel = vllm_config.parallel_config
@@ -248,6 +253,23 @@ class CudaGraphManager:
                 self.decode_query_lens,
             )
 
+        self._adaptive_mtp_tail_graphs = bool(
+            speculative_config is not None
+            and decode_query_len >= 4
+            and is_adaptive_mtp_enabled(speculative_config, decode_query_len - 1)
+            and not self.compilation_config.pass_config.enable_sp
+        )
+        if self._adaptive_mtp_tail_graphs:
+            self.decode_query_lens = tuple(
+                dict.fromkeys(
+                    (*self.decode_query_lens, *range(decode_query_len - 1, 2, -1))
+                )
+            )
+            logger.info_once(
+                "Capturing adaptive MTP single-request query lengths %s.",
+                self.decode_query_lens,
+            )
+
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.is_first_pp_rank = get_pp_group().is_first_rank
@@ -265,6 +287,11 @@ class CudaGraphManager:
                 vllm_config,
                 decode_query_len,
             )
+            if self._adaptive_mtp_tail_graphs and len(self.decode_query_lens) > 1:
+                for query_len in self.decode_query_lens:
+                    if query_len not in self._capture_sizes:
+                        self._capture_sizes.append(query_len)
+                self._capture_sizes.sort()
             logger.info_once(
                 "Using split SM70 MTP CUDA graph manager shapes: "
                 "decode_query_len=%d capture_sizes=%s shared_verifier_shapes=%s.",
@@ -316,7 +343,10 @@ class CudaGraphManager:
                         and num_tokens % query_len == 0
                     ):
                         if (
-                            self._sm70_dflash2_tail_graphs
+                            (
+                                self._sm70_dflash2_tail_graphs
+                                or self._adaptive_mtp_tail_graphs
+                            )
                             and query_len < self.decode_query_len
                             and num_tokens != query_len
                         ):
@@ -407,10 +437,15 @@ class CudaGraphManager:
                 with sm70_decode_graph_compilation(mode == CUDAGraphMode.FULL):
                     for desc in descs:
                         # Prepare inputs and get forward function
-                        forward_fn, attn_state = create_forward_fn(desc)
-
-                        # Warmup
-                        forward_fn(CUDAGraphMode.NONE)
+                        compile_full_graph = (
+                            desc.cg_mode != CUDAGraphMode.PIECEWISE
+                            and graph_policy().compile_graph
+                            and _worker_device_is_pre_ampere()
+                        )
+                        if not compile_full_graph:
+                            forward_fn, attn_state = create_forward_fn(desc)
+                            # Warmup
+                            forward_fn(CUDAGraphMode.NONE)
 
                         # Capture
                         logger.debug(
@@ -431,10 +466,7 @@ class CudaGraphManager:
                             assert desc not in self.graphs, (
                                 f"Graph already captured for {desc}"
                             )
-                            if (
-                                graph_policy().compile_graph
-                                and _worker_device_is_pre_ampere()
-                            ):
+                            if compile_full_graph:
                                 logger.info_once(
                                     "Running SM70 Flash-V100 compile full-graph "
                                     "pre-capture warmup for stable replay."
@@ -782,7 +814,10 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
 
-        return super().capture(create_forward_fn, progress_bar_desc)
+        with cudagraph_capture_stream_workspace_scope(
+            self.device, self.get_capture_context
+        ):
+            return super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

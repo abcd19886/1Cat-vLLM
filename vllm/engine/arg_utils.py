@@ -148,27 +148,63 @@ _UNSET_RETENTION_INTERVAL = -1
 def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
     resolved_dtype: str,
-) -> str:
+    *,
+    model_config: Any = None,
+    kernel_config: Any = None,
+    attention_backend: Any = None,
+) -> tuple[str, bool]:
     """Use E4M3 storage for the SM70 Flash-V100 ``fp8`` alias."""
-    if (
-        requested_dtype != "fp8"
-        or resolved_dtype != "fp8"
-        or not flash_v100_policy().enabled
-        or not current_platform.is_cuda()
-    ):
-        return resolved_dtype
+    from_checkpoint = requested_dtype == "auto" and resolved_dtype != "auto"
+    if requested_dtype == "int8":
+        return "int8_per_token_head", False
+    if not flash_v100_policy().enabled or not current_platform.is_cuda():
+        return resolved_dtype, from_checkpoint
     try:
         capability = current_platform.get_device_capability()
     except Exception:
-        return resolved_dtype
+        return resolved_dtype, from_checkpoint
     if capability is None or (capability.major, capability.minor) != (7, 0):
-        return resolved_dtype
-    logger.warning_once(
-        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
-        "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
-        "quantization is configured independently."
-    )
-    return "fp8_e4m3"
+        return resolved_dtype, from_checkpoint
+    if requested_dtype == "fp8" and resolved_dtype == "fp8":
+        logger.warning_once(
+            "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
+            "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
+            "quantization is configured independently."
+        )
+        return "fp8_e4m3", False
+    if (
+        requested_dtype == "auto"
+        and resolved_dtype == "auto"
+        and model_config is not None
+        and not model_config.is_attention_free
+        and not getattr(model_config, "use_mla", False)
+        and getattr(model_config.hf_text_config, "indexer_n_heads", None) is None
+        and getattr(model_config, "runner_type", "generate") == "generate"
+        and not getattr(kernel_config, "qsa_host_kv", False)
+    ):
+        backend_supports_int8 = True
+        if attention_backend is not None:
+            try:
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+                backend_enum = (
+                    attention_backend
+                    if isinstance(attention_backend, AttentionBackendEnum)
+                    else AttentionBackendEnum[str(attention_backend)]
+                )
+                backend_cls = backend_enum.get_class()
+                backend_supports_int8 = (
+                    "int8_per_token_head" in backend_cls.supported_kv_cache_dtypes
+                )
+            except Exception:
+                backend_supports_int8 = False
+        if backend_supports_int8:
+            logger.info_once(
+                "Defaulting KV cache storage to int8_per_token_head. "
+                "Pass --kv-cache-dtype float16 or fp8_e4m3 explicitly to override."
+            )
+            return "int8_per_token_head", False
+    return resolved_dtype, from_checkpoint
 
 
 # object is used to allow for special typing forms
@@ -565,8 +601,10 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
-    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    mixed_prefill_step_latency_ms: float = 0.0
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    split_mtp_phase_pure: bool | None = SchedulerConfig.split_mtp_phase_pure
+    split_mtp_prefill_cap: int = SchedulerConfig.split_mtp_prefill_cap
     short_prompt_chunk_tokens: int = SchedulerConfig.short_prompt_chunk_tokens
     short_prompt_threshold: int = SchedulerConfig.short_prompt_threshold
     long_prefill_token_threshold_adaptive: bool = (
@@ -1464,11 +1502,19 @@ class EngineArgs:
         # multi-step scheduling has been removed; corresponding arguments
         scheduler_group.add_argument(
             "--mixed-prefill-step-latency-ms",
-            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+            **{**scheduler_kwargs["mixed_prefill_step_latency_ms"], "default": 0.0},
         )
         scheduler_group.add_argument(
             "--mixed-prefill-min-tokens",
             **scheduler_kwargs["mixed_prefill_min_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--split-mtp-phase-pure",
+            **scheduler_kwargs["split_mtp_phase_pure"],
+        )
+        scheduler_group.add_argument(
+            "--split-mtp-prefill-cap",
+            **scheduler_kwargs["split_mtp_prefill_cap"],
         )
         scheduler_group.add_argument(
             "--short-prompt-chunk-tokens",
@@ -1810,6 +1856,7 @@ class EngineArgs:
         if self.block_size is None and self.mamba_block_size is None:
             self.block_size = _HYBRID_PREFIX_BLOCK_SIZE
             self.mamba_block_size = _HYBRID_PREFIX_BLOCK_SIZE
+            self._auto_hybrid_mamba_block_size = True
             updates.append(f"block_size={self.block_size}")
             updates.append(f"mamba_block_size={self.mamba_block_size}")
         if self.partial_prefix_cache is None:
@@ -1838,15 +1885,6 @@ class EngineArgs:
         model_config: ModelConfig,
     ) -> None:
         """Apply the 1Cat SM70 speculative serving defaults."""
-        mtp_defaults_disabled = (
-            envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
-            or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
-        )
-        explicit_dflash = isinstance(self.speculative_config, dict) and (
-            self.speculative_config.get("method") == "dflash"
-        )
-        if mtp_defaults_disabled and not explicit_dflash:
-            return
         if not current_platform.is_cuda_alike():
             return
         try:
@@ -1864,6 +1902,19 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
+        if is_server and self.max_num_seqs is None:
+            from vllm.model_executor.models.runtime_defaults import (
+                default_hybrid_server_max_num_seqs,
+            )
+
+            try:
+                dev_bytes = current_platform.get_device_total_memory()
+            except Exception:
+                dev_bytes = 0
+            bounded_seqs = default_hybrid_server_max_num_seqs(text_config, dev_bytes)
+            if bounded_seqs is not None:
+                self.max_num_seqs = bounded_seqs
+                profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
             self.enable_prefix_caching = True
             profile_updates.append(
@@ -1882,6 +1933,21 @@ class EngineArgs:
             and self.mamba_cache_mode == "align"
         ):
             profile_updates.extend(self._apply_hybrid_prefix_cache_geometry())
+
+        mtp_defaults_disabled = (
+            envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
+            or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
+        )
+        explicit_dflash = isinstance(self.speculative_config, dict) and (
+            self.speculative_config.get("method") == "dflash"
+        )
+        if mtp_defaults_disabled and not explicit_dflash:
+            if profile_updates:
+                logger.info_once(
+                    "Applied hybrid prefix-cache serving defaults: %s.",
+                    ", ".join(profile_updates),
+                )
+            return
 
         if self.speculative_config is None:
             enable_auto_mtp = (
@@ -2064,6 +2130,13 @@ class EngineArgs:
         self._check_feature_supported()
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+        _layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
+        if (
+            self.enable_prefix_caching
+            and self.mamba_cache_mode == "align"
+            and any(lt == "linear_attention" for lt in _layer_types)
+        ):
+            self._apply_hybrid_prefix_cache_geometry()
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):
@@ -2076,9 +2149,14 @@ class EngineArgs:
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
         )
-        resolved_cache_dtype = _resolve_sm70_flash_v100_kv_cache_dtype_alias(
-            self.kv_cache_dtype,
-            resolved_cache_dtype,
+        resolved_cache_dtype, cache_dtype_from_checkpoint = (
+            _resolve_sm70_flash_v100_kv_cache_dtype_alias(
+                self.kv_cache_dtype,
+                resolved_cache_dtype,
+                model_config=model_config,
+                kernel_config=self.kernel_config,
+                attention_backend=self.attention_backend,
+            )
         )
 
         assert self.enable_prefix_caching is not None, (
@@ -2113,9 +2191,9 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        cache_config.cache_dtype_from_checkpoint = (
-            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
-        )
+        cache_config.cache_dtype_from_checkpoint = cache_dtype_from_checkpoint
+        if getattr(self, "_auto_hybrid_mamba_block_size", False):
+            cache_config.user_specified_mamba_block_size = False
 
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -2370,6 +2448,17 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
+        split_mtp_phase_pure = self.split_mtp_phase_pure
+        if split_mtp_phase_pure is None:
+            if self.mixed_prefill_step_latency_ms > 0:
+                split_mtp_phase_pure = False
+            elif (
+                self.enable_chunked_prefill
+                and model_config.runner_type == "generate"
+                and not model_config.is_encoder_decoder
+                and self.pipeline_parallel_size == 1
+            ):
+                split_mtp_phase_pure = True
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2386,6 +2475,8 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            split_mtp_phase_pure=split_mtp_phase_pure,
+            split_mtp_prefill_cap=self.split_mtp_prefill_cap,
             short_prompt_chunk_tokens=self.short_prompt_chunk_tokens,
             short_prompt_threshold=self.short_prompt_threshold,
             long_prefill_token_threshold_adaptive=(

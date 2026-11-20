@@ -43,13 +43,28 @@ def test_candidate_guards_reject_unsupported_layouts(tp: int) -> None:
     ids = torch.zeros_like(values, dtype=torch.int64)
     kwargs = dict(vocab_size=248320, tp_size=tp)
     assert packed_topk_reason(values, ids, **kwargs) is None
+    for mtp_rows in (5, 10, 20, 40, 64):
+        mtp_vals = torch.zeros((mtp_rows, 64), device="cuda", dtype=torch.float32)
+        mtp_ids = torch.zeros_like(mtp_vals, dtype=torch.int64)
+        assert packed_topk_reason(mtp_vals, mtp_ids, **kwargs) is None
+    over_vals = torch.zeros((65, 64), device="cuda", dtype=torch.float32)
+    over_ids = torch.zeros_like(over_vals, dtype=torch.int64)
+    assert packed_topk_reason(over_vals, over_ids, **kwargs) == "unmeasured_row_count"
     assert packed_topk_reason(values, ids, vocab_size=2**31, tp_size=tp) == (
         "vocabulary_exceeds_int32"
     )
     assert packed_topk_reason(values.bfloat16(), ids, **kwargs) == "value_dtype"
     assert packed_topk_reason(values, ids.int(), **kwargs) == "token_id_layout"
-    assert packed_topk_reason(values[:, ::2], ids[:, ::2], **kwargs) == (
+    dflash_vals = torch.zeros((8, 16), device="cuda", dtype=torch.float16)
+    dflash_ids = torch.zeros_like(dflash_vals, dtype=torch.int64)
+    assert packed_topk_reason(dflash_vals, dflash_ids, **kwargs) is None
+    wide_vals = torch.zeros((8, 129), device="cuda", dtype=torch.float32)
+    wide_ids = torch.zeros_like(wide_vals, dtype=torch.int64)
+    assert packed_topk_reason(wide_vals, wide_ids, **kwargs) == (
         "unmeasured_candidate_count"
+    )
+    assert packed_topk_reason(values[:, ::2], ids[:, ::2], **kwargs) == (
+        "candidate_layout"
     )
     assert packed_topk_reason(values.expand(2, -1, -1), ids, **kwargs) == (
         "unmeasured_row_count"

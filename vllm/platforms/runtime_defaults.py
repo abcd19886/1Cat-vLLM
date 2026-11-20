@@ -363,26 +363,11 @@ def apply_runtime_policy_defaults(self):
             and self.model_config.multimodal_config is not None
             and not self.model_config.multimodal_config.language_model_only
         ):
-            from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
+            from vllm.config.multimodal import VideoDummyOptions
 
-            limit_per_prompt = self.model_config.multimodal_config.limit_per_prompt
-            if not limit_per_prompt:
-                limit_per_prompt.update(
-                    {
-                        "image": ImageDummyOptions(count=1, width=None, height=None),
-                        "video": VideoDummyOptions(
-                            count=0,
-                            num_frames=None,
-                            width=None,
-                            height=None,
-                        ),
-                    }
-                )
-                logger.info_once(
-                    "Using SM70 Flash-V100 multimodal default: image=1, "
-                    "video=0. Set --limit-mm-per-prompt to override."
-                )
-            elif "video" not in limit_per_prompt:
+            mm_cfg = self.model_config.multimodal_config
+            limit_per_prompt = mm_cfg.limit_per_prompt
+            if "video" not in limit_per_prompt:
                 limit_per_prompt["video"] = VideoDummyOptions(
                     count=0,
                     num_frames=None,
@@ -390,9 +375,14 @@ def apply_runtime_policy_defaults(self):
                     height=None,
                 )
                 logger.info_once(
-                    "Using SM70 Flash-V100 multimodal default: video=0 "
-                    "for partial --limit-mm-per-prompt override."
+                    "Using SM70 Flash-V100 multimodal default: image=unlimited, "
+                    "video=0. Set --limit-mm-per-prompt to override."
                 )
+            if (
+                mm_cfg.mm_encoder_batch_size == 0
+                and mm_cfg.get_limit_per_prompt("image") > 1
+            ):
+                mm_cfg.mm_encoder_batch_size = 1
         self.apply_model_runtime_defaults(defaults, "prefill", is_sm70=True)
         self.kernel_config.gdn.apply_platform_defaults()
         sm70_baseline_env_defaults = {
@@ -494,22 +484,17 @@ def apply_runtime_policy_defaults(self):
                 else f"decode gathers {host_gib} GiB pinned-host/device shards "
                 "per rank, prefill reads the disk-backed table",
             )
-    if self.speculative_config is not None:
-        policy = self.speculative_config.sm70_dflash2
-        qualification = self.apply_model_runtime_defaults(
-            defaults, "verifier", is_sm70=is_sm70
-        )
-        policy.resolve(**qualification)
-        if (
-            self.model_config is not None
-            and self.model_config.quantization == "fp8"
-            and self.kernel_config.sm70_fp8.qpn8 is None
-            and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
-        ):
-            self.kernel_config.sm70_fp8.qpn8 = policy.target_fp8_qpn8
-    if self.model_config is not None and self.model_config.quantization == "fp8":
-        # Resolve after the per-engine verifier defaults.
-        self.kernel_config.sm70_fp8.resolve()
+    qualification = self.apply_model_runtime_defaults(
+        defaults, "verifier", is_sm70=is_sm70
+    )
+    self.kernel_config.resolve_fp8_verifier_defaults(
+        model_quantization=(
+            self.model_config.quantization if self.model_config is not None else None
+        ),
+        speculative_config=self.speculative_config,
+        qualification=qualification,
+        use_native_block_prefill=is_sm70,
+    )
 
     sm70_flash_0dot3_compile_graph = defaults.value(
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH"

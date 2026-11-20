@@ -556,9 +556,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp_out = (
             self.mlp.forward_partials(block_input)
             if (
-                hc_sequence_parallel
-                and isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
+                isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
                 and getattr(self.mlp_hyper_connection, "_partial_inputs", False)
+                and not getattr(
+                    getattr(self.mlp.experts, "runner", None),
+                    "_fused_output_is_reduced",
+                    False,
+                )
             )
             else self.mlp(block_input)
         )
@@ -655,10 +659,17 @@ def enable_sm70_hcx(
         )
         from functools import partial
 
-        from .sm70_hcx import partial_moe_output, partial_projection
+        from .sm70_hcx import (
+            partial_moe_output,
+            partial_projection,
+            partial_projection_out,
+        )
 
         attention_module.output_projection_override = partial(
             partial_projection, prefix
+        )
+        attention_module.output_projection_out_override = partial(
+            partial_projection_out, prefix
         )
         # QSA still owns its model-specific projection dispatch.
         attention_module.sm70_hcx_projection_name = prefix
@@ -1299,9 +1310,11 @@ class Qwen4ExpForCausalLM(
 
         shared_banks = sum(share_prepared_banks(module) for module in self.modules())
         logger.info("Shared resident GGUF planes in %d fused projections", shared_banks)
+        from .ple_layer import prepare_sm70_ple_storage
         from .sm70_fp16_hc import prepare_sharded_hc_storage
 
         prepare_sharded_hc_storage(self, self.vllm_config)
+        prepare_sm70_ple_storage(self, self.vllm_config)
         if self.vllm_config.kernel_config.sm70_mtp_bounded_target_head:
             from vllm.model_executor.models.qwen3_5_mtp_bounded_head import (
                 prepare_mtp_bounded_target_head,

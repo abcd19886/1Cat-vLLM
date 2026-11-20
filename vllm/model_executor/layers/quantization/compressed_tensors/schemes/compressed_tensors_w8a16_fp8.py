@@ -189,6 +189,12 @@ _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
     (1536, 5120): (12, 2, False),
     (5120, 8704): (16, 2, False),
     (4352, 5120): (16, 2, False),
+    # TP=2 / unsharded local projection shapes for 5120-wide GDN + GQA models:
+    (5120, 8192): (16, 2, False),
+    (5120, 7168): (16, 2, False),
+    (3072, 5120): (16, 2, False),
+    (8704, 5120): (16, 2, False),
+    (5120, 17408): (16, 2, False),
 }
 _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
@@ -213,11 +219,9 @@ def _sm70_fp8_qpn8_enabled(enable_by_default: bool) -> bool:
 def _sm70_channel_fp8_qpn8_config(
     layer: torch.nn.Module,
 ) -> tuple[int, int, bool] | None:
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    if suffix not in _SM70_CHANNEL_FP8_QPN8_SHAPES:
-        return None
     if len(layer.weight.shape) != 2 or not _sm70_channel_fp8_shape_is_validated(layer):
         return None
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
     n_dim, k_dim = (int(dim) for dim in layer.weight.shape)
     if suffix == "gate_up_proj" and n_dim % 64:
         return None
@@ -403,23 +407,25 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         "VLLM_SM70_FP8_QPN8=1 requires the source-built SM70 "
                         f"QPN8 extension; missing ops: {missing_ops}."
                     )
+                oversize_output = int(layer.weight.shape[0]) > 32768
                 workspace = (
                     None
                     if missing_ops
-                    else _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
+                    else _get_sm70_fp8_prefill_exact_dense_workspace(
+                        layer.weight,
+                        cap_to_bounded_ceiling=oversize_output,
+                    )
                 )
                 if not missing_ops and workspace is not None:
                     qpn8_codes, qpn8_scales = self.native_ops.fp8_qpn8_prepare_sm70(
                         layer.weight, weight_scale
                     )
-                    policy = capture_sm70_dflash2_config()
-                    native_only = bool(
-                        policy is not None
-                        and policy.qualified
-                        and sm70_tm.use_native_qpn_layouts()
-                        and current_platform.is_device_capability(70)
+                    batch_tm = (
+                        not oversize_output
+                        and sm70_tm.should_prepare_channel_qpn8_batch_tm(
+                            linear_policy, platform=current_platform
+                        )
                     )
-                    batch_tm = sm70_tm.use_batched_gemm_layouts() and not native_only
                     if batch_tm:
                         gated = (
                             getattr(layer, "prefix", "").rsplit(".", 1)[-1]
@@ -460,6 +466,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     replace_parameter(layer, "weight", qpn8_codes)
                     del layer._parameters["weight_scale"]
                     replace_parameter(layer, "weight_scale_inv", qpn8_scales)
+                    sm70_tm.attach_channel_qpn8_prefill_workspace(layer, workspace)
                     split_k, nacc, prefetch = qpn8_config
                     layer.input_scale = None
                     layer.sm70_fp8_turbomind = True
@@ -607,7 +614,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 return out_2d.reshape(out_shape)
             if getattr(layer, "sm70_fp8_qpn8", False):
                 if getattr(layer, "sm70_fp8_batch_tm", False):
-                    torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch(
+                    self.native_ops.invoke(
+                        torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch,
                         out_2d,
                         x_2d,
                         layer.weight,
@@ -624,7 +632,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         self.native_ops.arguments,
                     )
                 else:
-                    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+                    self.native_ops.invoke(
+                        torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch,
                         out_2d,
                         x_2d,
                         layer.weight,

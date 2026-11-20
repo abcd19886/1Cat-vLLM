@@ -418,11 +418,27 @@ def _v41_fused_clip_count(runner, output_token_ids, batch):
         params.max_tokens,
         request.num_prompt_tokens,
         sorted(stops),
+        runner.model_config.get_vocab_size(),
     )
 
 
-def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
-    valid_token_mask = output_token_ids != -1
+def _count_contiguous_spec_tokens(
+    output_token_ids: torch.Tensor, vocab_size: int | None = None
+) -> torch.Tensor:
+    """Leading valid sampled ids per row (the step's accepted count).
+
+    With ``vocab_size``, valid means ``0 <= id < vocab_size``: the rule of
+    ``RejectionSampler.parse_output``, which builds the scheduler's tokens. An
+    out-of-vocabulary id (a NaN logits row's argmax: ``fast_argmax`` returns
+    the row width, a fully NaN row ``2**31 - 1``) is dropped there, so every
+    count derived on device must stop at it as well. Counting it made the
+    stateful models' commit (DeepSeek-V4.1 Engram/C2) run one token ahead of
+    the scheduler's position.
+    """
+    if vocab_size is None:
+        valid_token_mask = output_token_ids != -1
+    else:
+        valid_token_mask = (output_token_ids >= 0) & (output_token_ids < vocab_size)
     token_offsets = torch.arange(
         output_token_ids.shape[1],
         device=output_token_ids.device,
@@ -1155,6 +1171,7 @@ _V41_LATE_GATHER = envs.VLLM_V41_LATE_GATHER == "1"
 # graph per shape (GPUModelRunner._v41_propose_graphed).
 _V41_PROPOSE_GRAPH = envs.VLLM_V41_PROPOSE_GRAPH == "1"
 _V41_GREEDY_VERIFY = envs.VLLM_V41_NATIVE == "1" and envs.VLLM_V41_GREEDY_VERIFY == "1"
+_COUPLED_DRAFTS = envs.VLLM_V41_COUPLED_DRAFTS == "1"
 
 
 class GPUModelRunner(
@@ -1344,6 +1361,8 @@ class GPUModelRunner(
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
+        mm_config = model_config.multimodal_config
+        self.mm_encoder_batch_size = mm_config.mm_encoder_batch_size if mm_config else 0
 
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
@@ -2370,7 +2389,10 @@ class GPUModelRunner(
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_block_copies:
-            self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
+            self._kv_block_zeroer.copy_block_ids(
+                scheduler_output.kv_block_copies,
+                scheduler_output.kv_block_copy_groups,
+            )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -2412,6 +2434,24 @@ class GPUModelRunner(
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
+        ahead_set = scheduler_output.v41_ahead_req_ids
+        if _V41_AHEAD and ahead_set is not None and self.use_async_scheduling:
+            c_reqs = scheduler_output.scheduled_cached_reqs
+            all_toks = c_reqs.all_token_ids
+            still_in_batch = cached_req_ids - unscheduled_req_ids
+            resolved_in_batch = {
+                r
+                for i, r in enumerate(c_reqs.req_ids)
+                if r in still_in_batch
+                and r not in ahead_set
+                and c_reqs.num_output_tokens[i] > 0
+                and r in all_toks
+            }
+            if resolved_in_batch:
+                unscheduled_req_ids = unscheduled_req_ids | resolved_in_batch
+                if self.input_batch.prev_req_id_to_index:
+                    for r in resolved_in_batch:
+                        self.input_batch.prev_req_id_to_index.pop(r, None)
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -2475,7 +2515,9 @@ class GPUModelRunner(
                 restore = getattr(self.get_model(), "restore_prefix", None)
                 if restore is not None:
                     restore(
-                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                        new_req_data.num_computed_tokens,
+                        new_req_data.prompt_token_ids,
+                        req_id=req_id,
                     )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -2824,7 +2866,11 @@ class GPUModelRunner(
                     output_token_ids, batch.req_ids, self.requests, budget
                 )
             if fused is None:
-                commit_state(_count_contiguous_spec_tokens(output_token_ids))
+                commit_state(
+                    _count_contiguous_spec_tokens(
+                        output_token_ids, self.model_config.get_vocab_size()
+                    )
+                )
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -2866,7 +2912,9 @@ class GPUModelRunner(
             spec_state_slot_selectors = self.spec_state_slot_selectors.gpu[:num_reqs]
             profile_sidecar_cpu = True
         else:
-            num_accepted_tokens = _count_contiguous_spec_tokens(output_token_ids)
+            num_accepted_tokens = _count_contiguous_spec_tokens(
+                output_token_ids, self.model_config.get_vocab_size()
+            )
             spec_state_slot_selectors = num_accepted_tokens
             num_accepted_tokens_cpu = None
             spec_state_slot_selectors_cpu = None
@@ -3166,7 +3214,9 @@ class GPUModelRunner(
             dtype=torch.int32,
             device=sampled_token_ids.device,
         ).clamp(max=sampled_token_ids.shape[1])
-        valid_sampled_token_counts = _count_contiguous_spec_tokens(sampled_token_ids)
+        valid_sampled_token_counts = _count_contiguous_spec_tokens(
+            sampled_token_ids, self.model_config.get_vocab_size()
+        )
         clamped_counts = torch.minimum(valid_sampled_token_counts, max_generated)
         if torch.equal(clamped_counts, valid_sampled_token_counts):
             return sampler_output
@@ -7067,6 +7117,15 @@ class GPUModelRunner(
                 num_reqs_padded,
             )
 
+    def _mm_step(self) -> bool:
+        """Whether this step takes the multimodal input path. A model with
+        `text_steps_without_mm` runs steps without multimodal tokens (every
+        decode step, its CUDA graphs) on token ids, as a text-only model."""
+        model = self.get_model()
+        if not getattr(model, "text_steps_without_mm", False):
+            return True
+        return bool(model.step_has_mm_tokens())
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7090,7 +7149,12 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        if (
+            self.supports_mm_inputs
+            and is_first_rank
+            and not is_encoder_decoder
+            and self._mm_step()
+        ):
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -7479,6 +7543,51 @@ class GPUModelRunner(
             self.dynamic_draft_vocab_prefill_topk,
         )
 
+    def _fill_coupled_keys(self) -> None:
+        """V4.1 coupled drafts: this step's per-request stream keys, shared
+        with the drafter through coupled_draw.keys_buffer. Copied (pinned,
+        non-blocking: no stream sync) only when the batch's keys change."""
+        from vllm.v1.spec_decode import coupled_draw
+
+        num_reqs = self.input_batch.num_reqs
+        engine_seed = getattr(self.model_config, "seed", None) or 0
+        keys = []
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            params = self.requests[req_id].sampling_params
+            seed = None if params is None else params.seed
+            keys.append(coupled_draw.request_key(seed, req_id, engine_seed))
+        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+        # The buffer can be replaced (grown), so its address is part of the key.
+        state = (buffer.data_ptr(), keys)
+        if keys and state != getattr(self, "_coupled_keys_state", None):
+            staged = torch.tensor(keys, dtype=torch.int64).pin_memory()
+            buffer[:num_reqs].copy_(staged, non_blocking=True)
+            self._coupled_keys_state = state
+
+    def _set_coupled_rows(
+        self, metadata: SpecDecodeMetadata, logits: torch.Tensor
+    ) -> None:
+        """Per-logits-row output position (and per-request key) for keyed
+        verification.
+
+        Row i of `logits` is the token at self.positions[logits_indices[i]];
+        it predicts the next position. Skipped (regular rejection sampling)
+        when the rows do not follow the standard one-bonus-per-request layout.
+        """
+        from vllm.v1.spec_decode import coupled_draw
+
+        num_reqs = len(metadata.num_draft_tokens)
+        num_rows = sum(metadata.num_draft_tokens) + num_reqs
+        if (
+            logits.shape[0] != num_rows
+            or metadata.logits_indices.numel() != num_rows
+            or metadata.bonus_logits_indices.numel() != num_reqs
+        ):
+            return
+        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+        positions = self.positions[metadata.logits_indices.long()] + 1
+        self.rejection_sampler.set_coupled_rows(buffer[:num_reqs], positions)
+
     def _sample(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7489,6 +7598,8 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        if _COUPLED_DRAFTS and not sampling_metadata.all_greedy:
+            self._fill_coupled_keys()
         self._ddtree_accepted_rows_cpu_sidecar = None
         self._ddtree_sampled_token_counts_cpu_sidecar = None
         # Update output token ids with tokens sampled in last step
@@ -7549,7 +7660,9 @@ class GPUModelRunner(
             from vllm.models.deepseek_v41.greedy_head import verify_top_tokens
 
             top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
-            sampled = verify_top_tokens(top_tokens, spec_decode_metadata)
+            sampled = verify_top_tokens(
+                top_tokens, spec_decode_metadata, self.model_config.get_vocab_size()
+            )
             logger.info_once("V4.1 TP-local greedy verification enabled")
             return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
@@ -7999,6 +8112,13 @@ class GPUModelRunner(
                 spec_decode_metadata.draft_token_ids = torch.where(
                     index + 1 >= trunc, torch.full_like(drafts, -1), drafts
                 )
+        if (
+            _COUPLED_DRAFTS
+            and draft_probs is None
+            and logits is not None
+            and not sampling_metadata.all_greedy
+        ):
+            self._set_coupled_rows(spec_decode_metadata, logits)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -8017,7 +8137,9 @@ class GPUModelRunner(
             )
         if self._diagnostics.channels["mtp_step"].policy.directory:
             sampled_token_ids = sampler_output.sampled_token_ids
-            valid_sampled_count = _count_contiguous_spec_tokens(sampled_token_ids)
+            valid_sampled_count = _count_contiguous_spec_tokens(
+                sampled_token_ids, self.model_config.get_vocab_size()
+            )
             payload: dict[str, object] = {
                 "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
                 "sampled_token_ids": sampled_token_ids,
@@ -8939,6 +9061,12 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            # VLLM_V41_VISION: whether this step holds image-span tokens.
+            set_vision = getattr(self.get_model(), "v41_set_vision", None)
+            if set_vision is not None:
+                set_vision(
+                    self.input_ids.np[: scheduler_output.total_num_scheduled_tokens]
+                )
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0
@@ -10198,13 +10326,15 @@ class GPUModelRunner(
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
-        valid_counts = _count_contiguous_spec_tokens(sampled)
-        next_token_ids = (
-            sampled.gather(
-                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
-            )
-            .squeeze(1)
-            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        vocab_size = self.model_config.get_vocab_size()
+        valid_counts = _count_contiguous_spec_tokens(sampled, vocab_size)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        next_token_ids = torch.where(
+            (next_token_ids >= 0) & (next_token_ids < vocab_size),
+            next_token_ids,
+            torch.zeros_like(next_token_ids),
         )
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
@@ -10292,13 +10422,15 @@ class GPUModelRunner(
         )
         self._pp_token_comm().broadcast(payload, src=pp.world_size - 1)
         sampled = payload[:, : k + 1].contiguous()
-        valid_counts = _count_contiguous_spec_tokens(sampled)
-        next_token_ids = (
-            sampled.gather(
-                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
-            )
-            .squeeze(1)
-            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        vocab_size = self.model_config.get_vocab_size()
+        valid_counts = _count_contiguous_spec_tokens(sampled, vocab_size)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        next_token_ids = torch.where(
+            (next_token_ids >= 0) & (next_token_ids < vocab_size),
+            next_token_ids,
+            torch.zeros_like(next_token_ids),
         )
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
@@ -11854,7 +11986,11 @@ class GPUModelRunner(
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            if (
+                self.supports_mm_inputs
+                and not self.model_config.is_encoder_decoder
+                and not getattr(self.get_model(), "text_steps_without_mm", False)
+            ):
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
                 model_kwargs = {
@@ -12320,16 +12456,24 @@ class GPUModelRunner(
                             dummy_modality,
                         )
 
-                        # Create dummy batch of multimodal inputs.
-                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                            dummy_modality,
-                            max_mm_items_per_batch,
+                        # Create and run dummy multimodal inputs in bounded chunks.
+                        enc_bs = (
+                            self.mm_encoder_batch_size
+                            if self.mm_encoder_batch_size > 0
+                            else max_mm_items_per_batch
                         )
-
-                        # Run multimodal encoder.
-                        dummy_encoder_outputs = self.model.embed_multimodal(
-                            **batched_dummy_mm_inputs
-                        )
+                        dummy_encoder_outputs = []
+                        remaining = max_mm_items_per_batch
+                        while remaining > 0:
+                            chunk_n = min(enc_bs, remaining)
+                            batched_dummy_mm_inputs = self._get_mm_dummy_batch(
+                                dummy_modality,
+                                chunk_n,
+                            )
+                            dummy_encoder_outputs.extend(
+                                self.model.embed_multimodal(**batched_dummy_mm_inputs)
+                            )
+                            remaining -= chunk_n
 
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,
@@ -12339,6 +12483,10 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        pre_lm_stats = torch.accelerator.memory_stats(self.device)
+        pre_lm_peak = pre_lm_stats.get("allocated_bytes.all.peak", 0)
+        pre_lm_alloc = pre_lm_stats.get("allocated_bytes.all.current", 0)
+        torch.accelerator.reset_peak_memory_stats(self.device)
         _sm70_profile_trace("profile_run dummy_run enter")
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
@@ -12368,6 +12516,11 @@ class GPUModelRunner(
         _sm70_profile_trace("profile_run sync enter")
         self._sync_device()
         _sm70_profile_trace("profile_run sync exit")
+        lm_peak = torch.accelerator.memory_stats(self.device).get(
+            "allocated_bytes.all.peak", 0
+        )
+        self.language_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
+        self.profile_torch_peak = max(pre_lm_peak, lm_peak)
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()

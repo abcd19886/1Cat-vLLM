@@ -3,6 +3,7 @@
 
 import os
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2475,6 +2476,58 @@ def dsv3_router_gemm(
     return output
 
 
+@lru_cache(maxsize=1)
+def _load_native_sm70_router() -> bool:
+    import importlib
+
+    try:
+        importlib.import_module("vllm._sm70_router_C")
+    except ImportError:
+        return False
+    if not hasattr(torch.ops.vllm_sm70_router, "top10_batch"):
+        return False
+
+    @torch.library.register_fake("vllm_sm70_router::top10_batch")
+    def _top10_batch_fake(
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        source: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> None:
+        return None
+
+    return True
+
+
+def try_native_router_top10(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> bool:
+    num_tokens = gating_output.shape[0]
+    if not (
+        gating_output.is_cuda
+        and gating_output.dtype == torch.float16
+        and gating_output.is_contiguous()
+        and gating_output.shape == (num_tokens, 512)
+        and 1 <= num_tokens <= 64
+        and topk_weights.dtype == torch.float32
+        and topk_ids.dtype == torch.int32
+        and token_expert_indices.dtype == torch.int32
+        and topk_weights.is_contiguous()
+        and topk_ids.is_contiguous()
+        and token_expert_indices.is_contiguous()
+        and current_platform.is_device_capability(70)
+        and _load_native_sm70_router()
+    ):
+        return False
+    torch.ops.vllm_sm70_router.top10_batch(
+        topk_weights, topk_ids, token_expert_indices, gating_output
+    )
+    return True
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -3323,6 +3376,10 @@ def meta_size() -> int:
     return _custom_ar_op("meta_size")()
 
 
+def sm70_tp2_push_allreduce_buffer_size() -> int:
+    return _custom_ar_op("sm70_tp2_push_allreduce_buffer_size")()
+
+
 def sm70_tp4_push_allreduce_buffer_size() -> int:
     return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
@@ -3335,6 +3392,10 @@ def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
 
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return _custom_ar_op("register_buffer")(fa, ipc_tensors)
+
+
+def register_sm70_tp2_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
+    _custom_ar_op("register_sm70_tp2_push_allreduce_buffer")(fa, ipc_tensors)
 
 
 def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
@@ -4345,3 +4406,25 @@ if hasattr(torch.ops._C, "sm70_mtp_moe_bf16_out"):
     @register_fake("_C::sm70_mtp_moe_bf16_out")
     def _sm70_mtp_moe_bf16_fake(output, input, weight, ids, weights, padded, down):
         return None
+
+
+def maybe_register_tp2_push_buffer(
+    native,
+    ptr: int,
+    create_shared_buffer,
+    group,
+    logger_obj,
+) -> list[int] | None:
+    if not native.has(
+        "sm70_tp2_push_allreduce_buffer_size",
+        "register_sm70_tp2_push_allreduce_buffer",
+    ):
+        return None
+    push_buffer_size = native.sm70_tp2_push_allreduce_buffer_size()
+    ptrs = create_shared_buffer(push_buffer_size, group=group)
+    native.register_sm70_tp2_push_allreduce_buffer(ptr, ptrs)
+    logger_obj.info(
+        "SM70 TP2 1-stage push all-reduce enabled for FP16 payloads "
+        "through 640 KiB and 1..64-row fused Gemma RMSNorm."
+    )
+    return ptrs

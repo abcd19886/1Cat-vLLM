@@ -91,7 +91,7 @@ class H16Head:
         )
 
     def apply(self, layer, x, bias=None):
-        small = 1 <= x.shape[0] <= 8 and x.dtype == torch.float16
+        small = 1 <= x.shape[0] <= 32 and x.dtype == torch.float16
         if bias is None and x.is_cuda and small:
             out = torch.empty(x.shape[0], self.n, dtype=torch.float16, device=x.device)
             torch.ops.v41sk.h16_gemv(
@@ -193,8 +193,8 @@ def gate_route(gate, x, top_k, scale):
     if (
         h16 is None
         or x.dtype != torch.float16
-        or not 1 <= tokens <= 8
-        or tokens * top_k >= 64
+        or not 1 <= tokens <= 32
+        or tokens * top_k > 640
         or getattr(gate, "temperature", 1.0) != 1.0
     ):
         return None
@@ -750,7 +750,12 @@ class V41NativeMoEMethod(Mxfp4SM70MoEMethod):
         inter = w2.shape[2] * 2
         activated = torch.empty((slots, inter), dtype=x.dtype, device=x.device)
         probabilities = topk_weights.reshape(-1).float().contiguous()
-        if _W13_SWIGLU and 1 <= tokens <= 8 and x.shape[1] == 5120 and inter % 32 == 0:
+        if (
+            _W13_SWIGLU
+            and 1 <= tokens <= 768
+            and x.shape[1] == 5120
+            and inter % 32 == 0
+        ):
             torch.ops.v41sk.moe_w13_swiglu(
                 x,
                 w13,
@@ -892,10 +897,18 @@ class V41NativeMoEMethod(Mxfp4SM70MoEMethod):
 
 # ---------------------------------------------------------------- loading
 
+_VISION = envs.VLLM_V41_VISION == "1"
 _SKIP = re.compile(
-    r"(mtp\..*|vision.*|aligner\..*|image_.*|layers\.\d+\.engram\.embed\..*"
-    r"|layers\.\d+\.ffn\.gate\.bias_vl)"
+    r"(mtp\..*|layers\.\d+\.engram\.embed\..*"
+    + (
+        ""
+        if _VISION
+        else r"|vision.*|aligner\..*|image_.*|layers\.\d+\.ffn\.gate\.bias_vl"
+    )
+    + ")"
 )
+# VLLM_V41_VISION: the vision tower's checkpoint tensors (first stage only).
+_VISION_TENSOR = re.compile(r"(vision\.|aligner\.|image_(start|end|newline)$)")
 
 
 def native_weight_name(name: str) -> str | None:
@@ -904,6 +917,8 @@ def native_weight_name(name: str) -> str | None:
         return name  # sidecar tensors already carry parameter names
     if _SKIP.fullmatch(name):
         return None
+    if _VISION and _VISION_TENSOR.match(name):
+        return "vision_tower." + name
     if name == "embed.weight":
         return "model.embed_tokens.weight"
     if name == "head.weight":
@@ -944,7 +959,9 @@ def _converted(value, parameter, name):
     if not value.is_floating_point() or parameter.dtype == value.dtype:
         return value
     converted = value.to(parameter.dtype)
-    if name.endswith(_ROUNDED) and parameter.dtype == torch.float16:
+    if (
+        name.endswith(_ROUNDED) or name.startswith("vision_tower.")
+    ) and parameter.dtype == torch.float16:
         if not torch.isfinite(converted).all():
             raise ValueError(f"V4.1 native: {name} overflows {parameter.dtype}")
         changed = int((converted.to(value.dtype) != value).sum())
@@ -990,8 +1007,8 @@ def load_native_weights(model, weights: Iterable[tuple[str, torch.Tensor]]) -> s
             loaded.add(mapped)
             continue
         if name not in parameters:
-            if name.startswith(("lm_head.", "model.norm.")):
-                continue  # owned by the last stage
+            if name.startswith(("lm_head.", "model.norm.", "vision_tower.")):
+                continue  # owned by the last (vision: first) stage
             raise ValueError(f"V4.1 native: no parameter for {source} ({name})")
         parameter = parameters[name]
         value = _converted(value, parameter, name)
@@ -1029,12 +1046,15 @@ def _clip_count_kernel(
     max_tokens,
     L,
     NS,
+    VOCAB,
     LB: tl.constexpr,
     SB: tl.constexpr,
 ):
     j = tl.arange(0, LB)
     live = j < L
     v = tl.load(ids + j, live, -1).to(tl.int64)
+    # Out-of-vocabulary ids (NaN logits) are invalid, as in parse_output.
+    v = tl.where((v < 0) | (v >= VOCAB), -1, v)
     pre = tl.load(prefill).to(tl.int1)
     pos = tl.load(position)
     before = tl.where(pre, pos + tl.load(length), pos + 1)
@@ -1052,7 +1072,7 @@ def _clip_count_kernel(
     tl.store(count, first.to(tl.int32))
 
 
-def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids):
+def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids, vocab_size):
     """In-place clip of row 0 of ids [1, L]; returns the contiguous count [1]."""
     prefill, position, length = model.v41_pending()
     key = (ids.device, tuple(stop_ids))
@@ -1075,6 +1095,7 @@ def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids):
         max_tokens,
         L,
         len(stop_ids),
+        vocab_size,
         LB=max(16, triton.next_power_of_2(L)),
         SB=max(16, triton.next_power_of_2(max(1, len(stop_ids)))),
     )

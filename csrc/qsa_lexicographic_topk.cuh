@@ -15,8 +15,8 @@ namespace vllm::qsa {
 
 constexpr int kLexicographicTopKThreads = 1024;
 constexpr int kLexicographicTopKBins = 256;
-constexpr int kLexicographicTopKDecodeCandidateCapacity = 2304;
-constexpr int kLexicographicTopKCompactMinLength = 32768;
+constexpr int kLexicographicTopKDecodeCandidateCapacity = 3584;
+constexpr int kLexicographicTopKCompactMinLength = 2048;
 
 __device__ __forceinline__ uint32_t ordered_float_bits(float value) {
   // IEEE -0.0 and +0.0 compare equal, so keep them in the same score bucket
@@ -541,20 +541,19 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_compact_topk
     if (tx < TopK) indices[tx] = tx < length ? int32_t(tx) : -1;
     return;
   }
-  // Capacity can be large while a replay uses short live sequences. Make the
-  // length decision on device and preserve the original per-row short path.
+  if (rows == 1 ||
+      (decode_batch && length <= kLexicographicTopKDecodeCandidateCapacity)) {
+    qsa_lexicographic_decode_topk_body<TopK>(scores, lengths + row, indices,
+                                             columns, shared.decode);
+    return;
+  }
   const bool compact =
       length >= kLexicographicTopKCompactMinLength &&
       compact_score_pivot<TopK>(scores, length, shared.compact);
   if (!compact) {
     __syncthreads();
-    if (rows == 1 || (decode_batch && rows <= 16 && rows != 5 && rows != 10)) {
-      qsa_lexicographic_decode_topk_body<TopK>(scores, lengths + row, indices,
-                                               columns, shared.decode);
-    } else {
-      qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
-                                        stride, shared.exact);
-    }
+    qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
+                                      stride, shared.exact);
     return;
   }
   const uint32_t pivot = shared.compact.prefix;
@@ -619,7 +618,7 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    uint32_t columns, uint32_t stride,
                                    cudaStream_t stream,
                                    bool decode_batch = false) {
-  if (num_rows <= 32 && columns >= kLexicographicTopKCompactMinLength) {
+  if (num_rows <= 64 && columns >= kLexicographicTopKCompactMinLength) {
     qsa_lexicographic_compact_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride, decode_batch);
@@ -627,18 +626,12 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
                                                       columns, stride);
-  } else if (decode_batch && (num_rows == 5 || num_rows == 10) &&
-             columns <= 9216) {
+  } else if (decode_batch && num_rows <= 64 && columns <= 9216) {
     // Qualified through 32K context, allowing physical page padding. Longer
     // score buffers retain the original kernel and its resource allocation.
     qsa_lexicographic_mtp_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride);
-  } else if (decode_batch && num_rows <= 16 && num_rows != 5 &&
-             num_rows != 10) {
-    qsa_lexicographic_decode_topk_kernel<TopK>
-        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
-            logits, lengths, output, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

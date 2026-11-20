@@ -17,6 +17,37 @@ GOLDEN = [
     json.loads(line)
     for line in (FIXTURES / "flash_v100_trace_golden.jsonl").read_text().splitlines()
 ]
+# Later deliberate additions that leave the #1060 route unchanged: #1298 tries
+# split-KV for short prefix-prefill chunks before the dense candidates (here it
+# declines), and #1287 reads the FP8 prefix-bridge switch in the profiling
+# forward to reserve the long-prefix workspaces.
+_DECLINED_SPLITKV: tuple[list[object], ...] = (
+    ["call", "_try_prefill_dense_splitkv", None],
+    ["return", "_try_prefill_dense_splitkv", None],
+)
+_PROFILING_BRIDGE_READ: list[object] = ["predicate", "use_fp8_prefill_bridge", True]
+
+
+def _events_since_1060(case, events):
+    ignored: list[list[object]] = [*_DECLINED_SPLITKV]
+    if case.get("metadata_none"):
+        ignored.append(_PROFILING_BRIDGE_READ)
+    return [event for event in events if event not in ignored]
+
+
+# #1544 promotes eager ragged small-query E4M3 batches ([4, 1, 4], head=256,
+# gqa=6, causal) from scalar paged decode to padded grouped FP32 attention.
+def _is_1544_ragged_grouped_e4m3_case(case: dict) -> bool:
+    return (
+        case.get("stage") == "mixed"
+        and case.get("codec") == "fp8_e4m3"
+        and case.get("head") == 256
+        and case.get("gqa") == 6
+        and case.get("capture") is False
+        and case.get("spec") in ("dflash2", "mtp")
+        and case.get("mask") == "none"
+        and set(case) <= {"stage", "codec", "head", "gqa", "capture", "spec", "mask"}
+    )
 
 
 @pytest.mark.parametrize("start", range(1, len(GOLDEN), 128))
@@ -25,7 +56,15 @@ def test_forward_trace_matches_1060(start):
     # fixture for every case. Each constructs an independent real backend.
     for expected in GOLDEN[start : start + 128]:
         result = run_case(expected["case"])
-        assert result["events"] == expected["events"], expected["case"]
+        events = _events_since_1060(expected["case"], result["events"])
+        if _is_1544_ragged_grouped_e4m3_case(expected["case"]):
+            assert events[:18] == expected["events"][:18], expected["case"]
+            ops = [e[1] for e in events if e[0] == "op"]
+            routes = [e[1] for e in events if e[0] == "route"]
+            assert ops == ["grouped_e4m3", "grouped_e4m3"], expected["case"]
+            assert routes.count("prefill_smallq_e4m3_grouped_fp32") == 2
+        else:
+            assert events == expected["events"], expected["case"]
         buffers = [event[1] for event in result["events"] if event[0] == "buffers"]
         if buffers:
             assert len(buffers) == 2

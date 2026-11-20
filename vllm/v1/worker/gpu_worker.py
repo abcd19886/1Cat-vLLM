@@ -26,6 +26,10 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.device_communicators.cuda_wrapper import (
+    CUDA_LIMIT_STACK_SIZE,
+    CudaRTLibrary,
+)
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
@@ -710,6 +714,18 @@ class Worker(WorkerBase):
             if current_platform.is_cuda() and current_platform.is_device_capability(70)
             else nullcontext()
         )
+        # A cold compile (empty Triton or Inductor cache) autotunes, and some
+        # candidate configurations spill registers heavily. Launching one grows
+        # the driver's per-thread stack limit, and the local memory reserved
+        # for it (stack size times every thread the device can hold) stays
+        # allocated after the tuning. On a Quadro RTX 8000 the limit went from
+        # 1 KiB to 10 KiB, 0.63 GiB that a warm boot does not hold, so the KV
+        # budget depended on the compile cache and GLM-5.3's longest context
+        # no longer fit after a cache rebuild. Restore the limit before the
+        # measured forward: kernels serving needs grow it again there and are
+        # counted.
+        cudart = CudaRTLibrary() if current_platform.is_cuda() else None
+        stack_limit = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE) if cudart else 0
         try:
             with warmup_allocator:
                 self.model_runner.profile_run()
@@ -731,6 +747,17 @@ class Worker(WorkerBase):
                 total,
             )
             raise
+        if cudart is not None:
+            grown_stack_limit = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE)
+            if grown_stack_limit > stack_limit:
+                torch.accelerator.synchronize()
+                cudart.cudaDeviceSetLimit(CUDA_LIMIT_STACK_SIZE, stack_limit)
+                logger.info(
+                    "The warm-up grew the device stack limit from %d to %d "
+                    "bytes; restored it before measuring the KV budget.",
+                    stack_limit,
+                    grown_stack_limit,
+                )
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
@@ -773,9 +800,19 @@ class Worker(WorkerBase):
                 torch.cuda.memory._dump_snapshot(snapshot_path)
                 torch.cuda.memory._record_memory_history(enabled=None)
 
-            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
-                "allocated_bytes.all.peak", 0
+            profile_torch_peak = max(
+                torch.accelerator.memory_stats(self.device).get(
+                    "allocated_bytes.all.peak", 0
+                ),
+                getattr(self.model_runner, "profile_torch_peak", 0),
             )
+            language_peak_increase = getattr(
+                self.model_runner, "language_profile_peak_increase", None
+            )
+            if language_peak_increase is None:
+                language_peak_increase = (
+                    profile_torch_peak - profile_result.before_profile.torch_peak
+                )
 
             # Profile CUDA graph memory if graphs will be captured and the
             # estimator is enabled. 0.0.3-style SM70 runs disable this startup
@@ -797,7 +834,7 @@ class Worker(WorkerBase):
 
                     cudagraph_memory_estimate = get_sm70_cudagraph_memory_reserve(
                         self.vllm_config.compilation_config.cudagraph_mode,
-                        profile_torch_peak - profile_result.before_profile.torch_peak,
+                        language_peak_increase,
                     )
                     logger.info(
                         "SM70 graph memory reserve before KV allocation: %.2f GiB",
@@ -826,7 +863,7 @@ class Worker(WorkerBase):
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if graph_policy(self.vllm_config).estimate_graph_memory
-            else self._prefill_graph_reserve(profile_result.torch_peak_increase)
+            else self._prefill_graph_reserve(language_peak_increase)
         )
 
         self.non_torch_memory = profile_result.non_torch_increase
@@ -991,6 +1028,16 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.kernel_config.topology_all_reduce.enabled and not getattr(
+            self, "_topology_all_reduce_installed", False
+        ):
+            from vllm.distributed.device_communicators.topology_all_reduce import (
+                startup,
+            )
+
+            self._topology_all_reduce_routes = startup.install(self)
+            self._topology_all_reduce_installed = True
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1138,6 +1185,8 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        self._warmup_multimodal_triton_kernels()
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.triton_utils.jit_monitor import (
@@ -1153,6 +1202,63 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _warmup_multimodal_triton_kernels(self) -> None:
+        """Pre-compile multimodal encoder Triton kernels before JIT monitoring."""
+        if (
+            not self.model_config.is_multimodal_model
+            or self.device is None
+            or self.device.type != "cuda"
+        ):
+            return
+        try:
+            from vllm.model_executor.layers.rotary_embedding.common import (
+                ApplyRotaryEmb,
+            )
+        except Exception:
+            return
+        model = getattr(self.model_runner, "model", None)
+        if model is None or not hasattr(model, "modules"):
+            return
+        seen_specs: set[tuple[torch.dtype, int, int, bool, bool]] = set()
+        for module in model.modules():
+            rotary = getattr(module, "apply_rotary_emb", None)
+            if not isinstance(rotary, ApplyRotaryEmb):
+                continue
+            nheads = int(getattr(module, "num_attention_heads_per_partition", 0) or 4)
+            headdim = int(getattr(module, "hidden_size_per_attention_head", 0) or 64)
+            if headdim <= 0 or headdim % 2 != 0:
+                continue
+            spec = (
+                self.model_config.dtype,
+                nheads,
+                headdim,
+                bool(rotary.is_neox_style),
+                bool(rotary.enable_fp32_compute),
+            )
+            if spec in seen_specs:
+                continue
+            seen_specs.add(spec)
+            try:
+                dummy_x = torch.zeros(
+                    (2, 4, nheads, headdim),
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+                dummy_cos = torch.ones(
+                    (4, headdim // 2),
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+                dummy_sin = torch.zeros_like(dummy_cos)
+                rotary(dummy_x, dummy_cos, dummy_sin)
+                del dummy_x, dummy_cos, dummy_sin
+            except Exception:
+                logger.debug(
+                    "Skipping multimodal rotary Triton warmup for spec=%s",
+                    spec,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _release_compile_artifact_records() -> int:
@@ -1527,6 +1633,8 @@ class Worker(WorkerBase):
             raise RuntimeError("VLLM_V41_PP_RANK0 needs persistent PP input buffers")
         tp = get_tp_group()
         views = {key: value[:num_tokens] for key, value in buffers.tensors.items()}
+        max_cg = self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        early_side: torch.cuda.Stream | None = None
         if _PP_RECV_SIDE and num_tokens <= 256:
             # Slot j is reused 4 receiving steps later. The side stream first
             # waits for the main stream to pass the start of the step two
@@ -1561,21 +1669,23 @@ class Worker(WorkerBase):
                 handles = []
                 for value in views.values():
                     value.zero_()
-        elif _PP_RECV_EARLY and num_tokens > 8:
-            # Prefill: receive into fresh tensors from an idle side stream, so
-            # the transfer overlaps the previous step's forward (the graph
-            # input buffers are still being read by it).
-            views = {key: torch.empty_like(value) for key, value in views.items()}
+        elif _PP_RECV_EARLY and num_tokens > max(8, max_cg):
+            # Prefill (> max_cudagraph_capture_size): receive into fresh tensors
+            # allocated on an idle side stream so 40G IB transfers overlap the
+            # previous step's forward without touching CUDA graph buffers.
             if tp.rank_in_group == 0:
                 side = self._pp_recv_stream
                 if side is None:
                     side = self._pp_recv_stream = torch.cuda.Stream()
+                early_side = side
                 with torch.cuda.stream(side):
+                    views = {
+                        key: torch.empty_like(value) for key, value in views.items()
+                    }
                     handles = get_pp_group().irecv_tensor_dict_static(views)
             else:
+                views = {key: torch.zeros_like(value) for key, value in views.items()}
                 handles = []
-                for value in views.values():
-                    value.zero_()
         elif tp.rank_in_group == 0:
             handles = get_pp_group().irecv_tensor_dict_static(views)
         else:
@@ -1585,6 +1695,11 @@ class Worker(WorkerBase):
         tensor_dict = dict(views)
 
         def _broadcast() -> None:
+            if early_side is not None:
+                cur = torch.cuda.current_stream()
+                cur.wait_stream(early_side)
+                for v in views.values():
+                    v.record_stream(cur)
             for key, value in views.items():
                 if tp.world_size == 1:
                     continue

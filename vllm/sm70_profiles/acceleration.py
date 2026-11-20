@@ -487,14 +487,19 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
 
     return {
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
+        "fp16_kv_heads": hasattr(
+            torch.ops._vllm_fa2_C, "sm70_grouped_fp16_kv_heads_revision"
+        ),
         "fp16_short_splits": hasattr(
             torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
         ),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
+        "int8_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_int8_pth_fwd"),
         "long_operator": builtin_long_attention() is not None,
         "long_enabled": long_attention_enabled(policy),
         "page_supported": long_attention_page_supported(page_size, BUILTIN_MANIFEST),
         "scalar": scalar_tail_attention_available(),
+        "int8_scalar": hasattr(torch.ops._vllm_fa2_C, "sm70_scalar_int8_pth_fwd"),
         "q8000": _get_sm70_d256_gqa_architecture_q8192_op() is not None,
         "q4096": _get_sm70_d256_gqa_architecture_q4096_op() is not None,
         "bm32_aligned_pages": (
@@ -666,7 +671,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": device_history_reason,
         "scope": "configured_native_capability",
         "runtime_guards": (
-            "device E4M3/FP16 history; FP16 query; M1..20, H6, D256; width<=4096"
+            "device INT8/E4M3/FP16 history; FP16 query; M1..40, H6, D256; width<=4096"
         ),
         "arithmetic": "FP16 QK operands; FP32 accumulation, softmax, PV and merge",
         "fallback": "protected hot-page reader",
@@ -840,8 +845,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     fp16_shape = (
         str(cfg.model_config.dtype) == "torch.float16"
         and tp > 0
-        and full_heads == 6 * tp
-        and kv_heads == tp
+        and kv_heads > 0
+        and kv_heads % tp == 0
+        and full_heads == 6 * kv_heads
         and getattr(text, "head_dim", 0) == 256
     )
     fp16_reason = (
@@ -849,13 +855,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if dtype not in ("auto", "float16", "bfloat16") or not fp16_shape
         else "operator_missing:sm70_grouped_fp16_fwd"
         if not native.get("fp16_grouped", False)
+        else "operator_missing:sm70_grouped_fp16_kv_heads_revision"
+        if kv_heads > tp and not native.get("fp16_kv_heads", True)
         else None
     )
     paths["fp16_grouped_fp32"] = _row(
         fp16_reason,
         kv_cache_dtype=dtype,
-        runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
-        "causal full context; B1 q2..8 or B2..4 q8; "
+        runtime_guards="FP16 operands; local Q/KV ratio=6:1, D=256; 16-aligned page; "
+        "causal full context; B1..4 q2..8; "
         "served-window capacity requires the FP16 context revision",
         arithmetic="FP32 probability/PV/numerator/max/sum",
         short_context_splits=_row(
@@ -877,16 +885,25 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             if name not in ("e4m3_grouped_fp32", "long_context", "scalar_tail")
         ] + ["fp16_grouped_fp32"]
     paths["bm32_paged_prefill"] = _bm32_paged_prefill_report(cfg, native)
+    is_int8_kv = dtype in ("int8", "int8_per_token_head")
     grouped_reason = (
         "kv_dtype"
-        if dtype != "fp8_e4m3"
+        if dtype not in ("fp8_e4m3", "int8", "int8_per_token_head")
         else (
             "user_override"
             if not cfg.attention_config.flash_v100.options.value("e4m3_grouped_fp32")
             else (
                 None
-                if native["grouped_fp32"]
-                else "operator_missing:grouped_e4m3_fp32_revision4"
+                if (
+                    native.get("int8_grouped", native["grouped_fp32"])
+                    if is_int8_kv
+                    else native["grouped_fp32"]
+                )
+                else (
+                    "operator_missing:sm70_grouped_int8_pth_fwd"
+                    if is_int8_kv
+                    else "operator_missing:grouped_e4m3_fp32_revision4"
+                )
             )
         )
     )
@@ -900,8 +917,10 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         },
     )
     long_reason = grouped_reason or (
-        "operator_missing:sm70_grouped_long_fwd"
-        if not native["long_operator"]
+        "operator_missing:sm70_grouped_int8_pth_fwd"
+        if is_int8_kv and not native.get("int8_grouped", native["long_operator"])
+        else "operator_missing:sm70_grouped_long_fwd"
+        if not is_int8_kv and not native["long_operator"]
         else (
             "user_override"
             if not native["long_enabled"]
@@ -919,11 +938,19 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             )
             else (
                 "page_size"
-                if page_size < 1024
+                if page_size < (16 if is_int8_kv else 1024)
                 else (
                     None
-                    if native["scalar"]
-                    else "operator_missing:sm70_scalar_attention_fwd"
+                    if (
+                        native.get("int8_scalar", native["scalar"])
+                        if is_int8_kv
+                        else native["scalar"]
+                    )
+                    else (
+                        "operator_missing:sm70_scalar_int8_pth_fwd"
+                        if is_int8_kv
+                        else "operator_missing:sm70_scalar_attention_fwd"
+                    )
                 )
             )
         ),

@@ -83,6 +83,10 @@ def has_qwen38_shared_gate_sigmoid_mul() -> bool:
     return hasattr(torch.ops._C, "qwen38_shared_gate_sigmoid_mul_out")
 
 
+def has_qwen38_shared_down_gated() -> bool:
+    return hasattr(torch.ops._C, "qwen38_shared_down_gated_sm70_out")
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
@@ -106,6 +110,17 @@ def has_nvfp4_grouped_decode_dispatch() -> bool:
 
 def has_nvfp4_grouped_batch_reduce_dispatch() -> bool:
     return hasattr(torch.ops._C, "nvfp4_grouped_w2_batch_reduce_sm70_out")
+
+
+def has_nvfp4_grouped_raw_scale_dispatch() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in (
+            "nvfp4_grouped_w13_raw_sm70_out",
+            "nvfp4_grouped_w2_raw_sm70_out",
+            "nvfp4_grouped_w2_batch_reduce_raw_sm70_out",
+        )
+    )
 
 
 def has_nvfp4_qpn_w2_reduce_dispatch() -> bool:

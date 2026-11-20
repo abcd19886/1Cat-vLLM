@@ -21,9 +21,9 @@ def _history_workspace(device, width, rows):
     key = (device, width, rows)
     if key not in _WORKSPACES:
         reference_elements = max(
-            m * 6 * _attention_profile(m, width)[2] for m in range(1, 21)
+            m * 12 * _attention_profile(m, width)[2] for m in range(1, 21)
         )
-        native_elements = rows * 6 * ((width + 63) // 64)
+        native_elements = rows * 12 * ((width + 63) // 64)
         _WORKSPACES[key] = (
             torch.empty(
                 max(reference_elements, native_elements) * 256,
@@ -46,8 +46,9 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     reason = None
     if not enabled:
         reason = "user_override"
-    elif getattr(state, "is_speculative_draft", False) or (
-        cfg and cfg.is_speculative_draft
+    elif state.device_reference and (
+        getattr(state, "is_speculative_draft", False)
+        or (cfg and cfg.is_speculative_draft)
     ):
         reason = "speculative_draft_unqualified"
     elif not state.device_reference and not cfg_allows_host_native(cfg):
@@ -123,7 +124,7 @@ def cfg_allows_host_native(cfg) -> bool:
 
 
 def device_history_attention(
-    query, state, indices, table, requests, positions, lengths, out, gate
+    query, state, indices, table, requests, positions, lengths, out, gate, lse=None
 ):
     workspace = state.device_history_workspace
     if workspace is None:
@@ -136,9 +137,11 @@ def device_history_attention(
     if not (
         query.dtype == torch.float16
         and 0 < query.shape[0] <= rows_limit
-        and query.shape[1:] == (6, 256)
+        and query.shape[1] > 0
+        and query.shape[1] % 6 == 0
+        and query.shape[2] == 256
     ):
-        state.device_history_reason = "requires_M1_resolve_rows_H6_D256"
+        state.device_history_reason = "requires_M1_resolve_rows_H6x_D256"
         return False
     if (
         query.data_ptr() % 16
@@ -166,33 +169,61 @@ def device_history_attention(
     gate = gate.view_as(query) if gate is not None else None
     if hot:
         resolved = state.resolve_hot(indices, table, requests, positions, lengths)
-        op = (
-            torch.ops.vllm_sm70_qsa_device.run_hot_fp8
-            if getattr(state, "hot_fp8", False)
-            else torch.ops.vllm_sm70_qsa_device.run_hot
-        )
-        extra = (state.hot_scales,) if getattr(state, "hot_fp8", False) else ()
-        op(
-            query,
-            state.history,
-            state.scales,
-            indices,
-            table,
-            requests,
-            positions,
-            lengths,
-            out,
-            gate,
-            *workspace,
-            state.hot_values,
-            resolved,
-            *extra,
-        )
+        page_slots = getattr(state, "page_slots", None)
+        tags = getattr(state, "tags", None)
+        if getattr(state, "hot_fp8", False):
+            hot_tiles = (
+                3
+                if (query.shape[0] >= 16 and indices.shape[1] >= 1024)
+                else (2 if query.shape[0] >= 32 else 1)
+            )
+            torch.ops.vllm_sm70_qsa_device.run_hot_fp8(
+                query,
+                state.history,
+                state.scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                out,
+                gate,
+                *workspace,
+                state.hot_values,
+                resolved,
+                state.hot_scales,
+                hot_tiles,
+                page_slots,
+                tags,
+                lse,
+            )
+        else:
+            torch.ops.vllm_sm70_qsa_device.run_hot(
+                query,
+                state.history,
+                state.scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                out,
+                gate,
+                *workspace,
+                state.hot_values,
+                resolved,
+                1,
+                page_slots,
+                tags,
+                lse,
+            )
         state.device_history_reason = None
         logger.info_once(
             "Using SM70 native QSA attention over host history with a device "
             "hot cache (%s storage, FP32 PV)",
-            "E4M3" if getattr(state, "hot_fp8", False) else "FP16",
+            ("INT8" if getattr(state, "int8", False) else "E4M3")
+            if getattr(state, "hot_fp8", False)
+            else "FP16",
         )
         return True
     torch.ops.vllm_sm70_qsa_device.run(
@@ -207,6 +238,7 @@ def device_history_attention(
         out,
         gate,
         *workspace,
+        lse,
     )
     state.device_history_reason = None
     logger.info_once("Using SM70 native QSA device-history attention (FP32 PV)")
@@ -294,7 +326,10 @@ def _direct_history_triton(
         HISTORY_POSITIONS=positions,
         HISTORY_LENGTHS=lengths,
         DEVICE_HISTORY=True,
-        HISTORY_E4M3=state.fp8,
+        HISTORY_E4M3=getattr(
+            state, "e4m3", state.fp8 and not getattr(state, "int8", False)
+        ),
+        HISTORY_INT8=getattr(state, "int8", False),
         num_warps=warps,
         num_stages=2,
     )

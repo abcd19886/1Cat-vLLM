@@ -61,17 +61,21 @@ def _merge_windows(
     PartState,
     Out,
     Gate,
+    Lse,
     os0,
     os1,
     gs0,
     gs1,
+    ls0,
     H: tl.constexpr,
     D: tl.constexpr,
     FINAL: tl.constexpr,
     GATED: tl.constexpr,
+    OUT_FP32: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ):
     """Fold one window's normalized rows and (max, sum) into the running
-    rows; FINAL also writes the gated FP16 output like rows_fp8."""
+    rows; FINAL also writes the gated FP16 output (or FP32 + LSE for DCP)."""
     pid = tl.program_id(0)
     row, head = pid // H, pid % H
     m0 = tl.load(AccState + pid * 2)
@@ -87,21 +91,28 @@ def _merge_windows(
     b = tl.load(Part + pid * D + offs)
     value = tl.where(total > 0, (a * w0 + b * w1) / total, 0.0)
     if FINAL:
+        if WRITE_LSE:
+            lse_val = tl.where(total > 0, m + tl.log2(total), -float("inf"))
+            tl.store(Lse + row * ls0 + head, lse_val)
         if GATED:
             value = value.to(tl.float16).to(tl.float32)
             g = tl.load(Gate + row * gs0 + head * gs1 + offs).to(tl.float32)
             value = value / (1.0 + tl.exp2(-g * 1.4426950408889634))
-        tl.store(Out + row * os0 + head * os1 + offs, value.to(tl.float16))
+        tl.store(
+            Out + row * os0 + head * os1 + offs,
+            value if OUT_FP32 else value.to(tl.float16),
+        )
     else:
         tl.store(Acc + pid * D + offs, value)
         tl.store(AccState + pid * 2, m)
         tl.store(AccState + pid * 2 + 1, total)
 
 
-def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
+def merge_windows(acc, acc_state, part, part_state, out=None, gate=None, lse=None):
     rows, heads, dim = acc.shape
     final = out is not None
     gated = gate is not None
+    write_lse = final and lse is not None
     _merge_windows[(rows * heads,)](
         acc,
         acc_state,
@@ -109,14 +120,18 @@ def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
         part_state,
         out if final else acc,
         gate if gated else acc,
+        lse if write_lse else acc_state,
         out.stride(0) if final else 0,
         out.stride(1) if final else 0,
         gate.stride(0) if gated else 0,
         gate.stride(1) if gated else 0,
+        lse.stride(0) if write_lse else 0,
         H=heads,
         D=dim,
         FINAL=final,
         GATED=gated,
+        OUT_FP32=bool(final and out.dtype == torch.float32),
+        WRITE_LSE=write_lse,
         num_warps=2,
     )
 
@@ -142,6 +157,7 @@ def _write(
     HOT: tl.constexpr = True,
     HOT_FP8: tl.constexpr = False,
     HotScales=None,
+    INT8: tl.constexpr = False,
 ):
     # HOT=False: a plain history copy (a prefill stage buffer): no epoch,
     # no hot-cache update.
@@ -157,7 +173,16 @@ def _write(
             tl.load(K + row * Ks + dims[None, :]),
             tl.load(V + row * Vs + dims[None, :]),
         ).to(tl.float32)
-        if FP8:
+        if INT8:
+            scales = tl.maximum(tl.max(tl.abs(values), 1) * (1.0 / 127.0), 1.0e-8)
+            scaled = tl.clamp(
+                tl.extra.cuda.libdevice.rint(values / scales[:, None]),
+                -127.0,
+                127.0,
+            )
+            codes = scaled.to(tl.int8)
+            tl.store(Scales + slot * 2 + kv, scales)
+        elif FP8:
             scales = tl.maximum(tl.div_rn(tl.max(tl.abs(values), 1), 448.0), 2.0**-126)
             codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scales[:, None]))
             tl.store(Scales + slot * 2 + kv, scales)
@@ -175,7 +200,9 @@ def _write(
             resident = tl.load(PageSlots + page)
             tag = tl.load(Tags + tl.maximum(resident, 0), resident >= 0, other=-1)
             decoded = codes.to(tl.float16)
-            if FP8:
+            if INT8:
+                decoded = (codes.to(tl.float32) * scales[:, None]).to(tl.float16)
+            elif FP8:
                 decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
                     tl.float16
                 )
@@ -295,6 +322,7 @@ def _gather(
     HOT_FP8: tl.constexpr = False,
     HotScales=None,
     HANDS: tl.constexpr = 1,
+    INT8: tl.constexpr = False,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -343,9 +371,14 @@ def _gather(
                     initial_hit[:, None],
                     other=0,
                 )
-                values = (
-                    fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
-                ).to(tl.float16)
+                if INT8:
+                    values = (
+                        values.to(tl.int8).to(tl.float32) * scales[:, :, None]
+                    ).to(tl.float16)
+                else:
+                    values = (
+                        fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
+                    ).to(tl.float16)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
@@ -363,17 +396,13 @@ def _gather(
     pages = tl.reshape(tokens // 4, (4, 4))
     page_lanes = tl.arange(0, 4)
     first = tl.sum(tl.where(page_lanes[None, :] == 0, pages, 0), 1)
-    aligned = (
-        tl.sum(
-            tl.reshape(valid, (4, 4)).to(tl.int32)
-            * (
-                (pages == first[:, None])
-                & (tl.reshape(tokens % 4, (4, 4)) == page_lanes[None, :])
-            ),
-            1,
-        )
-        == 4
+    valid4 = tl.reshape(valid, (4, 4))
+    valid0 = tl.sum(tl.where(page_lanes[None, :] == 0, valid4.to(tl.int32), 0), 1) > 0
+    lane_match = ~valid4 | (
+        (pages == first[:, None])
+        & (tl.reshape(tokens % 4, (4, 4)) == page_lanes[None, :])
     )
+    aligned = valid0 & (tl.sum(lane_match.to(tl.int32), 1) == 4)
     registered = tl.load(PageSlots + first)
     slots = tl.maximum(registered, 0)
     tags = tl.load(Tags + slots, registered >= 0, other=-1)
@@ -456,9 +485,17 @@ def _gather(
     # A failed direct installation has no values to materialize.
     if STAGE > 0 or tl.sum(install.to(tl.int32), 0) > 0:
         need_cached = token_hits & (STAGE > 0)
-        need_history = valid & ~token_hits
-        if STAGE == 0:
-            need_history &= token_installs
+        phys_tokens = tl.reshape(first[:, None] * 4 + page_lanes[None, :], (16,))
+        hist_tokens = tl.where(token_installs, phys_tokens, tokens)
+        hist_blocks = tl.where(
+            token_installs, hist_tokens // Page, tl.maximum(blocks, 0)
+        )
+        hist_offsets = tl.where(
+            token_installs, hist_tokens % Page, tl.maximum(logical, 0) % Page
+        )
+        need_history = (
+            token_installs if STAGE == 0 else (token_installs | (valid & ~token_hits))
+        )
         cached = tl.load(
             Hot
             + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
@@ -472,18 +509,19 @@ def _gather(
                 need_cached[:, None],
                 other=0,
             )
-            cached = (
-                fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
-            ).to(tl.float16)
+            if INT8:
+                cached = (
+                    cached.to(tl.int8).to(tl.float32) * cached_scales[:, :, None]
+                ).to(tl.float16)
+            else:
+                cached = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
+                ).to(tl.float16)
         codes = tl.load(
             History
             + (
-                (
-                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
-                    + kv[None, :, None]
-                )
-                * Page
-                + (tl.maximum(logical, 0) % Page)[:, None, None]
+                (hist_blocks.to(tl.int64)[:, None, None] * 2 + kv[None, :, None]) * Page
+                + hist_offsets[:, None, None]
             )
             * Dim
             + dims[None, None, :],
@@ -492,13 +530,18 @@ def _gather(
         )
         if FP8:
             scales = tl.load(
-                Scales + tokens[:, None] * 2 + kv[None, :],
+                Scales + hist_tokens[:, None] * 2 + kv[None, :],
                 need_history[:, None],
                 other=0,
             )
-            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-                tl.float16
-            )
+            if INT8:
+                decoded = (codes.to(tl.int8).to(tl.float32) * scales[:, :, None]).to(
+                    tl.float16
+                )
+            else:
+                decoded = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]
+                ).to(tl.float16)
         else:
             decoded = codes.to(tl.float16)
         values = tl.where(token_hits[:, None, None], cached, decoded)
@@ -519,12 +562,13 @@ def _gather(
             store_values = columns < Padded
             if STAGE == 2:
                 store_values &= valid & ~(token_hits | token_installs)
+            out_values = tl.where(valid[:, None, None], values, 0)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
                 * Dim
                 + dims[None, None, :],
-                values,
+                out_values,
                 store_values[:, None, None],
             )
         tl.debug_barrier()
@@ -583,11 +627,15 @@ class HostQSAKV:
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
-        if dtype not in (torch.uint8, torch.float16):
-            raise ValueError("Host history requires E4M3 bytes or FP16 values")
-        self.fp8 = dtype == torch.uint8
+        if dtype not in (torch.uint8, torch.int8, torch.float16):
+            raise ValueError("Host history requires E4M3/INT8 bytes or FP16 values")
+        self.int8 = dtype == torch.int8
+        self.e4m3 = dtype == torch.uint8
+        self.fp8 = self.e4m3 or self.int8
         if hot_fp8 and not self.fp8:
-            raise ValueError("Encoded hot cache requires E4M3 authoritative history")
+            raise ValueError(
+                "Encoded hot cache requires E4M3 or INT8 authoritative history"
+            )
         self.hot_fp8 = hot_fp8
         self.device_reference = device_reference
         self.is_speculative_draft = is_speculative_draft
@@ -599,7 +647,7 @@ class HostQSAKV:
         elif history.shape != (blocks, 2, page_size, 1, dim) or (
             not history.is_contiguous()
         ):
-            raise ValueError("Host history must use contiguous page-major E4M3 bytes")
+            raise ValueError("Host history must use contiguous page-major bytes")
         scale_shape = (blocks * page_size if self.fp8 else 1, 2)
         if device_reference:
             # Preserve the host allocator geometry and byte layout for the
@@ -624,7 +672,7 @@ class HostQSAKV:
                 self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
         self.hot_values = torch.empty(
             (hot_tokens, 2, dim),
-            dtype=torch.uint8 if hot_fp8 else torch.float16,
+            dtype=dtype if hot_fp8 else torch.float16,
             device=device,
         )
         self.hot_scales = torch.empty(
@@ -688,6 +736,22 @@ class HostQSAKV:
         self.device_history_reason: str | None = None
         self.device_history_hot = False
         initialize_device_history_attention(self, direct_device)
+        self._miss_queue = torch.zeros(
+            self.resolve_rows * triton.cdiv(width, 16) + 2,
+            dtype=torch.int32,
+            device=device,
+        )
+        qsa_ns = (
+            getattr(torch.ops, "vllm_sm70_qsa_device", None)
+            if self._stage_host_run is not None
+            else None
+        )
+        self._resolve_hot_op = (
+            getattr(qsa_ns, "resolve_hot", None) if qsa_ns is not None else None
+        )
+        self._warm_hot_staged_op = (
+            getattr(qsa_ns, "warm_hot_staged", None) if qsa_ns is not None else None
+        )
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
         if key.shape[1:] != (1, self.dim) or value.shape != key.shape:
@@ -712,6 +776,7 @@ class HostQSAKV:
                 self.fp8,
                 HOT_FP8=self.hot_fp8,
                 HotScales=self.hot_scales,
+                INT8=self.int8,
                 num_warps=4,
             )
 
@@ -720,7 +785,7 @@ class HostQSAKV:
         (`history`/`scales` from stage_history): the same encoding as
         `write`, at each token's staged page, instead of copying the pages
         back from the host."""
-        _, k, _, pages, _ = plan
+        _, k, _, pages, _ = plan[:5]
         if not slots.numel() or not k:
             return
         page = self.page_size
@@ -756,28 +821,67 @@ class HostQSAKV:
             HOT=False,
             HOT_FP8=self.hot_fp8,
             HotScales=self.hot_scales,
+            INT8=self.int8,
             num_warps=4,
         )
 
-    def stage_plan(self, block_table, lengths, capacity_tokens):
+    def sync_stage_inputs(self, block_table, lengths):
+        """Copy `(block_table, lengths)` to CPU with at most one stream sync."""
+        table_cpu = block_table.to("cpu", non_blocking=True)
+        lengths_cpu = lengths.to("cpu", non_blocking=True)
+        if block_table.is_cuda:
+            torch.cuda.current_stream(block_table.device).synchronize()
+        elif lengths.is_cuda:
+            torch.cuda.current_stream(lengths.device).synchronize()
+        return table_cpu.numpy(), [int(n) for n in lengths_cpu.tolist()]
+
+    def stage_plan(
+        self,
+        block_table,
+        lengths,
+        capacity_tokens,
+        query_lens: list[int] | None = None,
+        host_inputs=None,
+    ):
         """Host plan for stage_history: (runs, pages, device table) or None.
 
         Depends only on the step's block table and lengths, so one plan
         (one host sync) serves every layer of a step with this geometry.
         """
         capacity = self._stage_capacity(capacity_tokens)
-        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        staged, sources, lengths_host, prefix_k, upto_k = self._stage_layout(
+            block_table,
+            lengths,
+            query_lens=query_lens,
+            host_inputs=host_inputs,
+        )
         if sources.size > capacity or not sources.size:
             return None
-        return self._make_stage_plan(staged, sources, lengths_host)
+        return self._make_stage_plan(
+            staged,
+            sources,
+            lengths_host,
+            prefix_k=prefix_k,
+            upto_k=upto_k,
+        )
 
-    def stage_window_plans(self, block_table, lengths, capacity_tokens):
+    def stage_window_plans(
+        self,
+        block_table,
+        lengths,
+        capacity_tokens,
+        host_inputs=None,
+    ):
         """stage_plan for a history larger than the stage buffer: one plan
         per buffer-sized window of the staged pages, or [] when the history
         fits (or is empty). A window's table maps only its own pages (-1
         elsewhere), so a row reader masks every other window's keys."""
         capacity = self._stage_capacity(capacity_tokens)
-        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        staged, sources, lengths_host, _, _ = self._stage_layout(
+            block_table,
+            lengths,
+            host_inputs=host_inputs,
+        )
         if sources.size <= capacity or not capacity:
             return []
         plans = []
@@ -791,32 +895,107 @@ class HostQSAKV:
             )
         return plans
 
-    def _stage_layout(self, block_table, lengths):
-        """(staged table, source pages, lengths): every request's valid pages
-        in order, numbered consecutively across requests."""
+    def _stage_layout(
+        self,
+        block_table,
+        lengths,
+        query_lens: list[int] | None = None,
+        host_inputs=None,
+    ):
+        """(staged table, source pages, lengths, prefix_k, upto_k): deduplicated
+        physical pages across requests, ordered as pure pre-step pages
+        `[0, prefix_k)`, partial boundary pages `[prefix_k, upto_k)`, and pure
+        in-step pages `[upto_k, k)` when `query_lens` is provided."""
         page = self.page_size
-        table = block_table.to("cpu", non_blocking=False).numpy()
-        lengths_host = [int(n) for n in lengths.tolist()]
+        table, lengths_host = (
+            host_inputs
+            if host_inputs is not None
+            else self.sync_stage_inputs(block_table, lengths)
+        )
         sizes = [(n + page - 1) // page for n in lengths_host]
-        # Vectorized per request: valid pages keep their order and get
-        # consecutive staged indices.
         staged = np.full(table.shape, -1, dtype=np.int32)
-        sources = []
-        k = 0
+
+        if query_lens is not None and len(query_lens) == len(lengths_host):
+            seen_mask = np.zeros(self.blocks, dtype=np.bool_)
+            has_old = np.zeros(self.blocks, dtype=np.bool_)
+            has_new = np.zeros(self.blocks, dtype=np.bool_)
+            seen_order: list[int] = []
+            req_valid: list[tuple[int, np.ndarray, np.ndarray]] = []
+            for request, count in enumerate(sizes):
+                if count <= 0:
+                    continue
+                row = table[request, :count]
+                valid = np.flatnonzero((row >= 0) & (row < self.blocks))
+                if not valid.size:
+                    continue
+                blks = row[valid]
+                req_valid.append((request, valid, blks))
+                len_r = lengths_host[request]
+                new_r = max(0, int(query_lens[request]))
+                old_r = max(0, len_r - new_r)
+                page_starts = valid * page
+                page_ends = np.minimum((valid + 1) * page, len_r)
+                old_mask = page_starts < old_r
+                new_mask = page_ends > old_r
+                if np.any(old_mask):
+                    has_old[blks[old_mask]] = True
+                if np.any(new_mask):
+                    has_new[blks[new_mask]] = True
+                for b in blks.tolist():
+                    if not seen_mask[b]:
+                        seen_mask[b] = True
+                        seen_order.append(b)
+            if not seen_order:
+                return staged, np.zeros(0, dtype=np.int32), lengths_host, 0, 0
+            seen_arr = np.asarray(seen_order, dtype=np.int32)
+            ho = has_old[seen_arr]
+            hn = has_new[seen_arr]
+            pure_old = seen_arr[ho & ~hn]
+            partial = seen_arr[ho & hn]
+            pure_new = seen_arr[~ho & hn]
+            prefix_k = int(pure_old.size)
+            upto_k = prefix_k + int(partial.size)
+            sources = np.concatenate((pure_old, partial, pure_new)).astype(
+                np.int32, copy=False
+            )
+            pos_of = np.full(self.blocks, -1, dtype=np.int32)
+            pos_of[sources] = np.arange(sources.size, dtype=np.int32)
+            for request, valid, blks in req_valid:
+                staged[request, valid] = pos_of[blks]
+            return staged, sources, lengths_host, prefix_k, upto_k
+
+        # Deduplicate physical pages across requests in encounter order while
+        # keeping exact page ordering for single-request unique tables.
+        pos_of = np.full(self.blocks, -1, dtype=np.int32)
+        unique_sources: list[int] = []
         for request, count in enumerate(sizes):
+            if count <= 0:
+                continue
             row = table[request, :count]
             valid = np.flatnonzero((row >= 0) & (row < self.blocks))
-            staged[request, valid] = np.arange(k, k + valid.size, dtype=np.int32)
-            sources.append(row[valid])
-            k += valid.size
+            if not valid.size:
+                continue
+            blks = row[valid]
+            for b in blks.tolist():
+                if pos_of[b] < 0:
+                    pos_of[b] = len(unique_sources)
+                    unique_sources.append(b)
+            staged[request, valid] = pos_of[blks]
         sources = (
-            np.concatenate(sources).astype(np.int32)
-            if sources
+            np.asarray(unique_sources, dtype=np.int32)
+            if unique_sources
             else np.zeros(0, dtype=np.int32)
         )
-        return staged, sources, lengths_host
+        return staged, sources, lengths_host, None, None
 
-    def _make_stage_plan(self, staged, sources, lengths_host):
+    def _make_stage_plan(
+        self,
+        staged,
+        sources,
+        lengths_host,
+        prefix_k: int | None = None,
+        upto_k: int | None = None,
+    ):
         k = int(sources.size)
         # Runs of consecutive source blocks (first block, first staged, count)
         # for the host-tensor copy path.
@@ -833,6 +1012,8 @@ class HostQSAKV:
             staged.to(device, non_blocking=True),
             pages.to(device, non_blocking=True),
             lengths_host,
+            prefix_k,
+            upto_k,
         )
 
     def _stage_capacity(self, capacity_tokens):
@@ -862,7 +1043,7 @@ class HostQSAKV:
 
     def _stage_range(self, plan, history, scales, first, last):
         """Copy staged pages [first, last) of `plan` into the stage views."""
-        runs, _, _, pages, _ = plan
+        runs, _, _, pages, _ = plan[:5]
         if last <= first:
             return
         page = self.page_size
@@ -915,8 +1096,9 @@ class HostQSAKV:
                 )
 
     def prefix_pages(self, plan, new_tokens):
-        """Staged pages holding only tokens written before this step (one
-        request), or 0 when the plan covers several requests."""
+        """Staged pages holding only tokens written before this step."""
+        if len(plan) >= 6 and plan[5] is not None:
+            return int(plan[5])
         lengths = plan[4]
         if len(lengths) != 1:
             return 0
@@ -965,7 +1147,7 @@ class HostQSAKV:
             plan = self.stage_plan(block_table, lengths, capacity_tokens)
         if plan is None:
             return None
-        _, k, staged_table, _, _ = plan
+        _, k, staged_table, _, _ = plan[:5]
         page = self.page_size
         history, scales = self._stage_views(capacity_tokens, slot)
         self._stage_range(
@@ -993,6 +1175,32 @@ class HostQSAKV:
         self._resolve(indices, block_table, token_to_req, positions, lengths, 0)
         return self.resolved[: indices.shape[0]]
 
+    def warm_hot_staged(self, block_table, staged_table, history, scales, lengths):
+        """Warm the hot cache directly from device-staged prefill history."""
+        if (
+            self._warm_hot_staged_op is None
+            or not self.device_history_hot
+            or block_table.stride(1) != 1
+            or staged_table.stride(1) != 1
+            or not lengths.is_contiguous()
+        ):
+            return
+        self._warm_hot_staged_op(
+            history,
+            scales,
+            self.hot_values,
+            self.hot_scales if self.hot_fp8 else None,
+            self.tags,
+            self.stamps,
+            self.epoch,
+            self.hands,
+            self.page_slots,
+            block_table,
+            staged_table,
+            lengths,
+            self.blocks,
+        )
+
     def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
         rows = indices.shape[0]
         capacity = self.rows if stage else self.resolve_rows
@@ -1001,6 +1209,38 @@ class HostQSAKV:
         if block_table.shape[0] != lengths.numel():
             raise ValueError("Host KV request metadata disagrees")
         if rows:
+            if (
+                stage == 0
+                and self._resolve_hot_op is not None
+                and indices.stride(1) == 1
+                and block_table.stride(1) == 1
+                and token_to_req.is_contiguous()
+                and positions.is_contiguous()
+                and lengths.is_contiguous()
+                and positions.dtype in (torch.int32, torch.int64)
+            ):
+                self._resolve_hot_op(
+                    self.history,
+                    self.scales,
+                    self.hot_values,
+                    self.hot_scales if self.hot_fp8 else None,
+                    self.tags,
+                    self.stamps,
+                    self.epoch,
+                    self.hands,
+                    self.page_slots,
+                    self._stats,
+                    self._miss_queue,
+                    indices,
+                    block_table,
+                    token_to_req,
+                    positions,
+                    lengths,
+                    self.positions,
+                    self.lengths,
+                    self.resolved,
+                )
+                return
             _protect[(rows, triton.cdiv(self.width, 256))](
                 indices,
                 block_table,
@@ -1058,6 +1298,7 @@ class HostQSAKV:
                 HOT_FP8=self.hot_fp8,
                 HotScales=self.hot_scales,
                 HANDS=self.num_hands,
+                INT8=self.int8,
                 num_warps=4,
             )
 

@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import hashlib
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from array import array
+from collections import OrderedDict
+from collections.abc import Awaitable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -24,6 +29,7 @@ from vllm.inputs import (
     TokensPrompt,
     build_enc_dec_input,
     embeds_input,
+    split_enc_dec_input,
     tokens_input,
 )
 from vllm.logger import init_logger
@@ -71,6 +77,128 @@ logger = init_logger(__name__)
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
 
 
+class _PrefixTokenizeCache:
+    """Bounded LRU cache of BPE token IDs up to ``<|im_start|>`` boundaries.
+
+    When ``<|im_start|>`` is verified at startup to be an atomic special token
+    that never merges across its left boundary, ``encode(text[:pos] +
+    text[pos:], add_special_tokens=False)`` equals ``encode(text[:pos],
+    add_special_tokens=False) + encode(text[pos:], add_special_tokens=False)``.
+    Multi-turn agent sessions therefore encode only newly appended turns instead
+    of re-tokenizing 40K-100K historical tokens on every turn.
+    """
+
+    _DELIM = "<|im_start|>"
+    _MIN_CHARS = 2048
+
+    def __init__(self, tokenizer: Any, max_entries: int = 96) -> None:
+        self._max_entries = max_entries
+        self._entries: OrderedDict[bytes, array[int]] = OrderedDict()
+        self._im_start_id: int | None = None
+        if tokenizer is None:
+            return
+        try:
+            vocab = tokenizer.get_vocab()
+            tok_id = vocab.get(self._DELIM) if isinstance(vocab, Mapping) else None
+            if not isinstance(tok_id, int) or isinstance(tok_id, bool) or tok_id < 0:
+                return
+            probe_l = "hello\n"
+            probe_r = f"{self._DELIM}user\nworld"
+            full = list(tokenizer.encode(probe_l + probe_r, add_special_tokens=False))
+            left = list(tokenizer.encode(probe_l, add_special_tokens=False))
+            right = list(tokenizer.encode(probe_r, add_special_tokens=False))
+            alone = list(tokenizer.encode(self._DELIM, add_special_tokens=False))
+            if (
+                alone == [tok_id]
+                and right
+                and right[0] == tok_id
+                and full == left + right
+            ):
+                self._im_start_id = tok_id
+        except Exception:
+            self._im_start_id = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._im_start_id is not None
+
+    def _put(self, digest: bytes, tokens: Sequence[int]) -> None:
+        if not tokens:
+            return
+        try:
+            packed = array("I", tokens)
+        except (OverflowError, TypeError):
+            return
+        self._entries[digest] = packed
+        self._entries.move_to_end(digest)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def plan(
+        self, text: str, encode_kwargs: Mapping[str, Any]
+    ) -> tuple[list[int], list[tuple[int, int, bytes]], int] | None:
+        if (
+            self._im_start_id is None
+            or len(text) < self._MIN_CHARS
+            or encode_kwargs.get("add_special_tokens", True)
+        ):
+            return None
+        delim = self._DELIM
+        dlen = len(delim)
+        starts: list[int] = []
+        pos = text.find(delim, 0)
+        while pos != -1:
+            starts.append(pos)
+            pos = text.find(delim, pos + dlen)
+        if not starts or starts[-1] == 0:
+            return None
+        checkpoints: list[tuple[int, int, bytes]] = []
+        h = hashlib.blake2b(digest_size=16)
+        prev = 0
+        for s_idx, s_pos in enumerate(starts):
+            if s_pos > 0:
+                h.update(text[prev:s_pos].encode("utf-8"))
+                prev = s_pos
+                checkpoints.append((s_idx, s_pos, h.digest()))
+        hit_ckpt_idx = -1
+        for idx in range(len(checkpoints) - 1, -1, -1):
+            if checkpoints[idx][2] in self._entries:
+                hit_ckpt_idx = idx
+                break
+        return starts, checkpoints, hit_ckpt_idx
+
+    def lookup(self, digest: bytes) -> list[int]:
+        self._entries.move_to_end(digest)
+        return self._entries[digest].tolist()
+
+    def record_full(
+        self,
+        starts: list[int],
+        checkpoints: list[tuple[int, int, bytes]],
+        full_ids: Sequence[int],
+        hit_ckpt_idx: int = -1,
+    ) -> None:
+        im_start_id = self._im_start_id
+        if im_start_id is None:
+            return
+        delim_locs = [i for i, tid in enumerate(full_ids) if tid == im_start_id]
+        if len(delim_locs) != len(starts):
+            return
+        n_ckpts = len(checkpoints)
+        save_indices: set[int] = {n_ckpts - 1}
+        if n_ckpts >= 2:
+            save_indices.add(0)
+            save_indices.add(n_ckpts - 2)
+        for idx in range(7, n_ckpts, 8):
+            save_indices.add(idx)
+        for ckpt_idx in sorted(save_indices):
+            if ckpt_idx <= hit_ckpt_idx:
+                continue
+            s_idx, _, digest = checkpoints[ckpt_idx]
+            if 0 < s_idx < len(delim_locs):
+                self._put(digest, full_ids[: delim_locs[s_idx]])
+
+
 class BaseRenderer(ABC, Generic[_T]):
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
@@ -80,6 +208,9 @@ class BaseRenderer(ABC, Generic[_T]):
         self.api_process_rank = config.parallel_config._api_process_rank
 
         self.tokenizer = tokenizer
+        self._rendered_mm_hashes: ContextVar[list[str] | None] = ContextVar(
+            "rendered_mm_hashes", default=None
+        )
 
         # Shared thread pool executor for blocking tokenizer and
         # multimodal preprocessing operations.  The multimodal processor
@@ -94,12 +225,16 @@ class BaseRenderer(ABC, Generic[_T]):
 
         # Lazy initialization since offline LLM doesn't use async
         self._async_tokenizer: AsyncMicrobatchTokenizer | None = None
+        self._prefix_tok_cache = _PrefixTokenizeCache(self.tokenizer)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
         self._readonly_mm_processor: BaseMultiModalProcessor | None = None
         self._mm_cache_stats: MultiModalCacheStats | None = None
         self._clear_mm_cache_async = make_async(
             self.clear_mm_cache, executor=self._executor
+        )
+        self._invalidate_mm_cache_items_async = make_async(
+            self.invalidate_mm_cache_items, executor=self._mm_executor
         )
         self._process_multimodal_async = make_async(
             self._process_multimodal, executor=self._mm_executor
@@ -189,6 +324,18 @@ class BaseRenderer(ABC, Generic[_T]):
         if self._mm_cache_stats is not None:
             self._mm_cache_stats.reset = True
 
+    def invalidate_mm_cache_items(self, mm_hashes: Sequence[str]) -> None:
+        """Drop sender-cache entries whose engine-side copy may be missing
+        (a request that sent them without data failed, see
+        `MultiModalCacheMissError`), so the next request that uses them sends
+        their data again."""
+        mm_processor_cache = self.mm_processor_cache
+        if mm_processor_cache is None:
+            return
+
+        for mm_hash in mm_hashes:
+            mm_processor_cache.invalidate(mm_hash)
+
     @staticmethod
     def _clear_processor_cache(
         processor: "BaseMultiModalProcessor | None",
@@ -273,6 +420,35 @@ class BaseRenderer(ABC, Generic[_T]):
         """Serialize clear_mm_cache through the shared executor to avoid
         races with concurrent process_inputs on the mm_processor_cache."""
         await self._clear_mm_cache_async()
+
+    def invalidate_mm_cache_items_async(
+        self, mm_hashes: Sequence[str]
+    ) -> Awaitable[None]:
+        """Run invalidate_mm_cache_items on the multimodal executor, like
+        clear_mm_cache_async. The work is submitted when this is called, so it
+        runs before any rendering submitted later; awaiting is optional."""
+        return self._invalidate_mm_cache_items_async(mm_hashes)
+
+    @contextmanager
+    def track_mm_cache_items(self):
+        """Track rendered items until the serving layer accepts the request."""
+        hashes: list[str] = []
+        token = self._rendered_mm_hashes.set(hashes)
+        try:
+            yield hashes
+        finally:
+            self._rendered_mm_hashes.reset(token)
+
+    @staticmethod
+    def get_mm_hashes(engine_input: EngineInput) -> list[str]:
+        encoder, decoder = split_enc_dec_input(engine_input)
+        return [
+            mm_hash
+            for inputs in (encoder, decoder)
+            if inputs is not None and inputs["type"] == "multimodal"
+            for hashes in inputs["mm_hashes"].values()
+            for mm_hash in hashes
+        ]
 
     def shutdown(self) -> None:
         mm_processor_cache = self.mm_processor_cache
@@ -404,10 +580,34 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
-        prompt_token_ids = tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
+        encode_kwargs = params.get_encode_kwargs()
+        text = prompt["prompt"]
+        cache = getattr(self, "_prefix_tok_cache", None)
+        plan = (
+            cache.plan(text, encode_kwargs)
+            if cache is not None and params.truncate_prompt_tokens is None
+            else None
         )
+        if plan is not None and cache is not None:
+            starts, checkpoints, hit_idx = plan
+            if hit_idx >= 0:
+                _, hit_pos, hit_digest = checkpoints[hit_idx]
+                prefix_ids = cache.lookup(hit_digest)
+                tail_ids = tokenizer.encode(
+                    text[hit_pos:], truncation=False, add_special_tokens=False
+                )
+                prompt_token_ids = prefix_ids + list(tail_ids)
+                cache.record_full(starts, checkpoints, prompt_token_ids, hit_idx)
+            else:
+                prompt_token_ids = list(
+                    tokenizer.encode(text, truncation=False, add_special_tokens=False)
+                )
+                cache.record_full(starts, checkpoints, prompt_token_ids)
+            max_len = encode_kwargs.get("max_length")
+            if encode_kwargs.get("truncation") and max_len is not None:
+                prompt_token_ids = prompt_token_ids[:max_len]
+        else:
+            prompt_token_ids = tokenizer.encode(text, **encode_kwargs)
 
         return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
 
@@ -417,10 +617,36 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_async_tokenizer()
-        prompt_token_ids = await tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
+        encode_kwargs = params.get_encode_kwargs()
+        text = prompt["prompt"]
+        cache = getattr(self, "_prefix_tok_cache", None)
+        plan = (
+            cache.plan(text, encode_kwargs)
+            if cache is not None and params.truncate_prompt_tokens is None
+            else None
         )
+        if plan is not None and cache is not None:
+            starts, checkpoints, hit_idx = plan
+            if hit_idx >= 0:
+                _, hit_pos, hit_digest = checkpoints[hit_idx]
+                prefix_ids = cache.lookup(hit_digest)
+                tail_ids = await tokenizer.encode(
+                    text[hit_pos:], truncation=False, add_special_tokens=False
+                )
+                prompt_token_ids = prefix_ids + list(tail_ids)
+                cache.record_full(starts, checkpoints, prompt_token_ids, hit_idx)
+            else:
+                prompt_token_ids = list(
+                    await tokenizer.encode(
+                        text, truncation=False, add_special_tokens=False
+                    )
+                )
+                cache.record_full(starts, checkpoints, prompt_token_ids)
+            max_len = encode_kwargs.get("max_length")
+            if encode_kwargs.get("truncation") and max_len is not None:
+                prompt_token_ids = prompt_token_ids[:max_len]
+        else:
+            prompt_token_ids = await tokenizer.encode(text, **encode_kwargs)
 
         return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
 
@@ -884,6 +1110,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input["arrival_time"] = arrival_time
 
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
+
         return engine_input
 
     async def process_for_engine_async(
@@ -905,6 +1134,9 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 

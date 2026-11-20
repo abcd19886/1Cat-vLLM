@@ -57,6 +57,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle3,
+    SupportsMultiModal,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -66,6 +67,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.deepseek_v41 import dense_tm
 from vllm.models.deepseek_v41.activations import swiglu
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -92,8 +94,22 @@ from .native import NATIVE as _NATIVE
 from .norm import set_decode_rows, short_rms_norm, short_rows
 from .pp_commit import StageCommit
 from .quant_rope import apply_rope, attention_qdq, rope_table
+from .vision import (
+    DEFAULT_IMAGE_TOKEN_ID,
+    IMAGE_PLACEHOLDER,
+    VISION,
+    DeepseekV41DummyInputsBuilder,
+    DeepseekV41MultiModalProcessor,
+    DeepseekV41ProcessingInfo,
+    V41VisionTower,
+)
 
 logger = init_logger(__name__)
+
+# VLLM_V41_VISION: image-span rows of the target forward being run (None when
+# the batch has no image token). Every MoE gate of the stage routes those rows
+# with its VL bias; set and cleared by DeepseekV41Model.forward only.
+_VL_MASK: list[torch.Tensor | None] = [None]
 
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
 _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
@@ -119,7 +135,7 @@ class V41Norm(nn.Module):
             x.is_cuda
             and x.dtype == torch.float16
             and x.ndim == 2
-            and short_rows(x.shape[0])
+            and x.shape[0] >= 1
             and x.shape[1] in (128, 512, 1280, 5120)
             and x.is_contiguous()
         ):
@@ -170,6 +186,15 @@ class V41Gate(nn.Module):
         self.bias = nn.Parameter(
             torch.empty(config.n_routed_experts, dtype=torch.float32),
             requires_grad=False,
+        )
+        # Routing bias of image-span tokens (selects experts, never scales).
+        self.bias_vl = (
+            nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            if VISION
+            else None
         )
         self.temperature = getattr(config, "gate_temp", 1.0)
 
@@ -246,7 +271,12 @@ class V41MoE(nn.Module):
         if self.native and x.is_cuda:
             from .native import gate_route
 
-            fused = gate_route(self.gate, x, self.experts.top_k, self.scale)
+            # Image rows take the VL bias: route in _route, not in the gate.
+            fused = (
+                gate_route(self.gate, x, self.experts.top_k, self.scale)
+                if _VL_MASK[0] is None
+                else None
+            )
             if fused is not None:
                 self._fused_route = fused
                 return fused[0]
@@ -255,15 +285,34 @@ class V41MoE(nn.Module):
                 plain is not None
                 and x.dtype == torch.float16
                 and self.gate.temperature == 1.0
-                and x.shape[0] > 8
+                and x.shape[0] > 32
             ):
                 # Exact FP16 * 2^s products, FP32 accumulation (as h16_gemv).
                 logits = torch.mm(x.contiguous(), plain, out_dtype=torch.float32)
                 return logits.mul_(self.gate.v41_h16[2])
         return self.gate(x)
 
+    def _route_vl(self, gating_output, image, topk):
+        """The reference gate with a per-row bias: VL rows add bias_vl."""
+        bias_vl = self.gate.bias_vl
+        assert bias_vl is not None
+        scores = F.softplus(gating_output.float()).sqrt()
+        bias = torch.where(image[:, None], bias_vl, self.gate.bias)
+        indices = (scores + bias).topk(topk, dim=-1).indices
+        probabilities = scores.gather(1, indices)
+        probabilities = probabilities / (probabilities.sum(-1, keepdim=True) + 1e-20)
+        return (probabilities * self.scale).contiguous(), indices
+
     def _route(self, hidden_states, gating_output, topk, renormalize):
         del hidden_states, renormalize
+        image = _VL_MASK[0]
+        if (
+            image is not None
+            and self.gate.bias_vl is not None
+            and image.shape[0] == gating_output.shape[0]
+        ):
+            self._fused_route = None
+            return self._route_vl(gating_output, image, topk)
         fused = getattr(self, "_fused_route", None)
         if fused is not None and fused[0] is gating_output:
             self._fused_route = None
@@ -411,7 +460,7 @@ class V41Compressor(nn.Module):
             and _NATIVE
             and x.is_cuda
             and x.dtype == torch.float16
-            and 8 < x.shape[0] <= 1024
+            and x.shape[0] > 32
         ):
             # VLLM_V41_BATCH: the same exact FP16 * 2^s products on cuBLAS
             # with FP32 accumulation and output.
@@ -419,7 +468,7 @@ class V41Compressor(nn.Module):
             out.mul_(state[2])
             return out[:, :512].contiguous(), out[:, 512:].contiguous()
         if not (
-            _NATIVE and x.is_cuda and x.dtype == torch.float16 and 1 <= x.shape[0] <= 8
+            _NATIVE and x.is_cuda and x.dtype == torch.float16 and 1 <= x.shape[0] <= 32
         ):
             return None
         if not state:  # prepare_loaded_linear_weights builds it (or False)
@@ -434,6 +483,20 @@ class V41Compressor(nn.Module):
 class V41Indexer(nn.Module):
     def __init__(self, c, quant_config, source, ratio, prefix):
         super().__init__()
+
+        from .index_tiled import IndexTiledScorer
+
+        policy = get_current_vllm_config().attention_config.v41_index_tiled
+        if not isinstance(policy.enabled, bool):
+            raise RuntimeError("V4.1 tiled index policy was not initialized")
+        if policy.enabled and not _PACKED_KV:
+            raise ValueError("V4.1 tiled index requires packed KV")
+        self.heads = c.index_n_heads // 4
+        # The model adapter binds the effective policy before graph-key creation.
+        policy.active = bool(_PACKED_KV and policy.enabled)
+        self.index_scorer = (
+            IndexTiledScorer(policy.library, self.heads) if policy.active else None
+        )
         kwargs = dict(bias=False, return_bias=False, quant_config=quant_config)
         self.wq_b = ColumnParallelLinear(
             c.q_lora_rank,
@@ -555,6 +618,8 @@ class V41Indexer(nn.Module):
                 valid_tokens,
                 ratio,
                 _index_all_reduce(),
+                bank=getattr(store, "index_bank", None),
+                scorer=self.index_scorer,
             )
         metadata = source_cache.metadata()
         keys = gather_index_keys(
@@ -1348,6 +1413,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         self.hash_state: V41EngramHashState | None = None
         self.engram_io: SharedEngramIO | None = None
+        # VLLM_V41_VISION: every image-span position carries this id; the
+        # runner tells (v41_set_vision) whether this step holds any of them.
+        self.image_token_id = int(
+            getattr(
+                vllm_config.model_config.hf_config,
+                "image_token_id",
+                DEFAULT_IMAGE_TOKEN_ID,
+            )
+        )
+        self.vl_step = False
         # This stage's Engram layers (channels of the shared reader) and
         # whether it holds committed per-step state (Engram hash history,
         # ratio-2 compressors). On the GGUF route that is the first stage only
@@ -1421,6 +1496,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             self._slot_of: dict[str, int] = {}
             self._free_slots = list(range(slots - 1, -1, -1))
             self._slot_done: dict[int, torch.cuda.Event | None] = {}
+            # Prefix hits of requests not yet in a batch: req id -> (cached
+            # tokens, the 3 prompt tokens before the hit), applied when the
+            # request takes its fresh state slot.
+            self._pending_restore: dict[str, tuple[int, list[int]]] = {}
             self.batch_lengths = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_positions = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_prefill = torch.zeros(slots, dtype=torch.bool, device=device)
@@ -1495,6 +1574,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # One extra slot (index max_slots) takes the padding rows of graph
             # batches, so they never touch a live request's state.
             self.hash_batch = V41EngramHashBatch(self.hash_state, self.max_slots + 1)
+        if VISION:
+            # Image tokens take no part in an n-gram (the reference's DEAD
+            # token): their compressed id -1 blocks every n-gram through them,
+            # in the hashes, the per-request histories and prefix restores.
+            self.hash_state.token_map[self.image_token_id] = -1
         path = self.vllm_config.load_config.model_loader_extra_config["engram_path"]
         self.engram_io = SharedEngramIO(
             path, max_tokens=maximum, channels=self.engram_channels
@@ -1521,6 +1605,26 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def forward(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
+        image = None
+        if (
+            VISION
+            and self.vl_step
+            and input_ids is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Prefill steps only (no image token is ever in a graph batch).
+            image = input_ids[: positions.numel()] == self.image_token_id
+        _VL_MASK[0] = image
+        try:
+            return self._forward(
+                input_ids, positions, inputs_embeds, intermediate_tensors, image
+            )
+        finally:
+            _VL_MASK[0] = None
+
+    def _forward(
+        self, input_ids, positions, inputs_embeds, intermediate_tensors, image
     ):
         tokens = positions.numel()
         self._intermediate = intermediate_tensors
@@ -1585,14 +1689,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # of its last FFN; this stage starts with the reference mixes.
             hidden, pre = intermediate_tensors["hidden"], intermediate_tensors["pre"]
         auxiliary: Any = []
+        # Image-span rows get no Engram contribution (the gate is shut).
+        engram_valid = valid if image is None or valid is None else valid & ~image
         if _HC_FUSED:
             result = self._forward_fused(
-                hidden, positions, pre, metadata, valid, auxiliary
+                hidden, positions, pre, metadata, engram_valid, auxiliary
             )
             _join_expert_writebacks()
         else:
             result = self._forward_reference(
-                hidden, positions, pre, metadata, valid, auxiliary
+                hidden, positions, pre, metadata, engram_valid, auxiliary
             )
             _join_expert_writebacks()
         if isinstance(result, IntermediateTensors):
@@ -1673,7 +1779,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     raise RuntimeError("V4.1 batch: more live requests than slots")
                 slot = self._free_slots.pop()
                 self._slot_of[req_id] = slot
-                fresh.append(slot)
+                fresh.append((slot, req_id))
         host = self._slot_hosts[self._slot_turn]
         event = self._slot_events[self._slot_turn]
         self._slot_turn = (self._slot_turn + 1) % len(self._slot_hosts)
@@ -1684,11 +1790,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         self.req_slots.copy_(host, non_blocking=True)
         event.record()
-        for slot in fresh:
+        for slot, req_id in fresh:
             done = self._slot_done.pop(slot, None)
             if done is not None:
                 torch.cuda.current_stream().wait_event(done)
             self._reset_slot(slot)
+            pending = self._pending_restore.pop(req_id, None)
+            if pending is not None:
+                self._restore_slot(slot, *pending)
 
     def v41_release(self, req_ids, done=None):
         """Runner hook: finished requests give their state slots back. done:
@@ -1701,6 +1810,26 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             if slot is not None:
                 self._free_slots.insert(0, slot)  # reuse the oldest last
                 self._slot_done[slot] = done
+
+    def _restore_slot(self, slot, cached, tail):
+        """A fresh slot at a prefix hit: the C2 pair and the Engram hash
+        history continue at `cached` (an even position: no partial pair)."""
+        for i in range(self.start_layer, self.end_layer):
+            compressor = getattr(self.layers[i].attn, "compressor", None)
+            state = getattr(compressor, "state_batch", None)
+            if state is not None:
+                state.position[slot] = cached
+        hash_state = self.hash_state
+        if self.hash_batch is None or hash_state is None:
+            return
+        device = hash_state.history.device
+        ids = torch.tensor(
+            [-1] * (3 - len(tail)) + list(tail), dtype=torch.long, device=device
+        )
+        mapped = hash_state.token_map[ids.clamp_min(0)].long()
+        history = self.hash_batch.history[slot]
+        history[:3].copy_(torch.where(ids >= 0, mapped, -1))
+        history[3] = cached
 
     def _reset_slot(self, slot):
         if self.hash_batch is not None:
@@ -2007,13 +2136,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if count is not None:
             self._commit(self.stage_commit_count.fill_(count))
 
-    def restore_prefix(self, cached, prompt_ids):
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
         """Rewind per-sequence device state to a same-session prefix hit.
+
+        VLLM_V41_BATCH: any even hit (paged window caches hold the rows the
+        hit covers); the request's state slot continues at it once assigned.
 
         The scheduler only admits hits that continue the last executed
         sequence at an even position inside the window rings' reach, so the
         rings need no rewind. Later PP stages hold nothing else.
         """
+        if _BATCH and req_id is not None:
+            assert cached % 2 == 0
+            tail = list(prompt_ids[max(0, cached - 3) : cached])
+            self._pending_restore[req_id] = (cached, tail)
+            return
         assert cached % 2 == 0
         if self.stage_commit is not None:
             self.stage_commit.reset()
@@ -2082,7 +2219,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         return (max_tokens - before).clamp_min(0)
 
 
-class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
+@MULTIMODAL_REGISTRY.register_processor(
+    DeepseekV41MultiModalProcessor,
+    info=DeepseekV41ProcessingInfo,
+    dummy_inputs=DeepseekV41DummyInputsBuilder,
+)
+class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMultiModal):
+    # Image inputs only with VLLM_V41_VISION=1 (the processing info offers no
+    # modality otherwise, so the runner stays on token ids and full graphs).
+    # Every stage reads the token ids: image rows are told apart by their id.
+    requires_raw_input_tokens = True
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return IMAGE_PLACEHOLDER
+        raise ValueError("V4.1 accepts image inputs only")
+
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
         c = self.config = vllm_config.model_config.hf_text_config
@@ -2174,12 +2327,91 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(c.vocab_size)
+        # Read by the spec-decode proposer of a multimodal target.
+        c.image_token_index = self.model.image_token_id
+        # The vision tower runs where the embeddings are made (first stage),
+        # replicated on its TP ranks; rank 0's spans are broadcast.
+        self.vision_tower: V41VisionTower | None = None
+        if VISION and get_pp_group().is_first_rank:
+            if not _NATIVE:
+                raise ValueError("VLLM_V41_VISION needs the native weights")
+            vision_config = getattr(
+                vllm_config.model_config.hf_config, "vision_config", None
+            )
+            if not vision_config:
+                raise ValueError("VLLM_V41_VISION: the config has no vision tower")
+            self.vision_tower = V41VisionTower(
+                vision_config, c.hidden_size, vllm_config.model_config.dtype
+            )
 
-    def embed_input_ids(self, input_ids):
-        return self.model.embed_tokens(input_ids)
+    def embed_input_ids(
+        self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
+    ):
+        embeddings = self.model.embed_tokens(input_ids)
+        if not multimodal_embeddings or is_multimodal is None:
+            return embeddings
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        return _merge_multimodal_embeddings(
+            embeddings, multimodal_embeddings, is_multimodal
+        )
+
+    def embed_multimodal(self, **kwargs: object):
+        patches = kwargs.get("pixel_patches")
+        if patches is None:
+            return []
+        sizes = kwargs["patches_per_image"]
+        grids = kwargs["vit_grid"]
+        if isinstance(patches, list):
+            patches = torch.cat(list(patches))
+        sizes = torch.as_tensor(sizes).reshape(-1).tolist()
+        grids = torch.as_tensor(grids).reshape(-1, 2).tolist()
+        tower = self.vision_tower
+        if tower is None:
+            # Only the profile run gets here (embeddings are consumed on the
+            # first stage): spans of the right shape, never used.
+            ratio = 3
+            return [
+                torch.zeros(
+                    -(-int(h) // ratio) * (-(-int(w) // ratio) + 1) + 2,
+                    self.config.hidden_size,
+                    dtype=self.model.embed_tokens.weight.dtype,
+                    device=self.model.embed_tokens.weight.device,
+                )
+                for h, w in grids
+            ]
+        assert isinstance(patches, torch.Tensor)
+        device = tower.image_start.device
+        spans = []
+        for chunk, (n_h, n_w) in zip(patches.split(sizes), grids):
+            span = tower.span(chunk.to(device), int(n_h), int(n_w))
+            if get_tensor_model_parallel_world_size() > 1:
+                from vllm.distributed import get_tp_group
+
+                # Every TP rank must route identical rows.
+                span = get_tp_group().broadcast(span.contiguous(), src=0)
+            spans.append(span)
+        return spans
+
+    # Steps without image tokens (all decode steps and their graphs) keep the
+    # text path: token ids, embedding inside the graph, no encoder gather.
+    text_steps_without_mm = True
+
+    def step_has_mm_tokens(self) -> bool:
+        return self.model.vl_step
+
+    def v41_set_vision(self, input_ids_np):
+        """Runner hook (host ids of the step): does it hold image tokens?"""
+        if VISION:
+            self.model.vl_step = bool((input_ids_np == self.model.image_token_id).any())
 
     def forward(
-        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         if intermediate_tensors is None:
             return self.model(input_ids, positions, inputs_embeds)
@@ -2228,7 +2460,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
             not isinstance(self.lm_head.quant_method, H16Head)
             or get_tensor_model_parallel_world_size() != 4
             or hidden_states.dtype != torch.float16
-            or not 1 <= hidden_states.shape[0] <= 6
+            or not 1 <= hidden_states.shape[0] <= 192
             or self.logits_processor.soft_cap is not None
             or self.logits_processor.scale != 1.0
             or self.lm_head.num_embeddings != self.lm_head.org_vocab_size
@@ -2250,6 +2482,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
         if _NATIVE:
             return load_native_weights(self, weights)
         return AutoWeightsLoader(self).load_weights(weights)
+
+    def get_language_model(self):
+        return self
 
     def prepare_loaded_linear_weights(self):
         if envs.VLLM_V41_GATE_BF16 == "1":
@@ -2288,6 +2523,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
                     module._v41_h16 = h16_exact(weight, keep_plain=_BATCH) or False
             if not isinstance(self.lm_head, PPMissingLayer):
                 attach_h16_head(self.lm_head)
+            engram_io = getattr(self.model, "engram_io", None)
+            if engram_io is not None and engram_io.owner is not None:
+                engram_io.owner.start_page_cache_warm()
             torch.accelerator.empty_cache()
         self.model.prepare_postload()
 
@@ -2300,8 +2538,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
     def pp_before_forward(self, req_ids, num_computed):
         self.model.pp_before_forward(req_ids, num_computed)
 
-    def restore_prefix(self, cached, prompt_ids):
-        self.model.restore_prefix(cached, prompt_ids)
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
+        self.model.restore_prefix(cached, prompt_ids, req_id)
 
     def stateful_output_budget(self, max_tokens, prompt_tokens):
         return self.model.output_budget(max_tokens, prompt_tokens)

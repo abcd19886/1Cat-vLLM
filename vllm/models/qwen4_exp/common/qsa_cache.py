@@ -620,6 +620,8 @@ class QSAForwardMetadata(AttentionMetadata):
     query_start_loc_cpu: torch.Tensor | None = None
     # Host upper bound of seq_lens (bounds prefill scoring without a sync).
     max_seq_len: int | None = None
+    # Per-request host upper bounds of seq_lens for multi-request splits.
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -815,6 +817,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             compress_ratio=self.compress_ratio,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=_host_max_seq_len(common_attn_metadata),
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         )
 
 
@@ -829,6 +832,10 @@ class QSAStateBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "int8",
+        "int8_per_token_head",
     ]
 
     @staticmethod
@@ -976,6 +983,11 @@ class QSAKeyStateCache(_QSAStateCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        while (
+            capacity < self.cache_config.block_size
+            and self.cache_config.block_size % capacity != 0
+        ):
+            capacity += self.compress_ratio
         assert self.cache_config.block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"

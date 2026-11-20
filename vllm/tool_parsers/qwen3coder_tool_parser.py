@@ -6,6 +6,14 @@ from collections.abc import Sequence
 from typing import Any
 
 import regex as re
+from xgrammar import Grammar, StructuralTag
+from xgrammar.structural_tag import (
+    OptionalFormat,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+)
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -114,6 +122,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.current_param_value = ""
         self.param_count = 0
         self.in_param = False
+        self.param_raw_streamed = 0
         self.in_function = False
         self.accumulated_text = ""
         self.json_started = False
@@ -171,6 +180,67 @@ class Qwen3CoderToolParser(ToolParser):
         param_schema = param_config.get(param_name, {})
         param_types = extract_types_from_schema(param_schema)
         return coerce_to_schema_type(param_value, param_types)
+
+    def _is_streamable_string_param(
+        self, param_name: str, param_config: dict[str, Any]
+    ) -> bool:
+        """Return True only when the schema strictly types the param as string."""
+        if param_name not in param_config:
+            return False
+        raw_types = extract_types_from_schema(param_config[param_name])
+        normalized = {t.strip().lower() for t in raw_types}
+        return normalized in ({"string"}, {"str"}, {"text"})
+
+    def _safe_streamable_string_len(self, raw_body: str, min_offset: int) -> int:
+        """Safe prefix length of an open XML string value that cannot be markup.
+
+        Holds back:
+        1. Any complete ``</parameter>`` whose suffix could still become a
+           structural boundary once more lookahead tokens arrive.
+        2. Any trailing ``<...`` suffix that could complete into a closing or
+           sibling tag.
+        3. One trailing ``\\n``, because XML parameter parsing strips a single
+           final ``\\n`` immediately preceding ``</parameter>``.
+        """
+        safe_end = len(raw_body)
+        container_prefixes = (
+            self.function_end_token,
+            self.tool_call_end_token,
+            self.parameter_prefix,
+        )
+        search_from = max(0, min_offset)
+        while True:
+            close_idx = raw_body.find(self.parameter_end_token, search_from)
+            if close_idx == -1 or close_idx >= safe_end:
+                break
+            rem = raw_body[close_idx + len(self.parameter_end_token) :].lstrip()
+            could_be_structural = (
+                not rem
+                or any(tok.startswith(rem) for tok in container_prefixes)
+                or (rem.startswith(self.parameter_prefix) and ">" not in rem)
+            )
+            if could_be_structural:
+                safe_end = close_idx
+                break
+            search_from = close_idx + len(self.parameter_end_token)
+
+        lt_idx = raw_body.rfind("<", 0, safe_end)
+        if lt_idx != -1:
+            tail = raw_body[lt_idx:safe_end]
+            tag_prefixes = (
+                self.parameter_end_token,
+                self.function_end_token,
+                self.tool_call_end_token,
+                self.parameter_prefix,
+            )
+            if any(tok.startswith(tail) for tok in tag_prefixes) or (
+                tail.startswith(self.parameter_prefix) and ">" not in tail
+            ):
+                safe_end = lt_idx
+
+        if safe_end > 0 and raw_body[safe_end - 1] == "\n":
+            safe_end -= 1
+        return max(min_offset, safe_end)
 
     def _parameter_start_positions(
         self,
@@ -308,9 +378,10 @@ class Qwen3CoderToolParser(ToolParser):
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
 
-            param_dict[param_name] = self._convert_param_value(
-                param_value, param_name, param_config, function_name
-            )
+            if param_name not in param_dict:
+                param_dict[param_name] = self._convert_param_value(
+                    param_value, param_name, param_config, function_name
+                )
         return ToolCall(
             type="function",
             function=FunctionCall(
@@ -668,26 +739,18 @@ class Qwen3CoderToolParser(ToolParser):
         if json_delta is not None:
             return json_delta
 
-        # Check if we need to advance to next tool
-        if self.json_closed and not self.in_function:
-            # Check if this tool call has ended
-            tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self._current_tool_block():
-                # This tool has ended, advance to next
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.json_started = False
-                self.json_closed = False
-                self.accumulated_params = {}
-
-                # Check if there are more tool calls
-                tool_starts = current_text.count(self.tool_call_start_token)
-                if self._current_tool_block() >= tool_starts:
-                    # No more tool calls
-                    self.is_tool_call_started = False
-                # Continue processing next tool
+        # Check if we need to advance past a completed tool block.
+        if (
+            self._advance_closed_tool_block(current_text)
+            and not self.is_tool_call_started
+        ):
+            if delta_text.strip() == "":
                 return None
+            tail = current_text[self.content_search_start :]
+            held_prefix = self._trailing_tool_marker_prefix(current_text)
+            if held_prefix:
+                tail = tail[: -len(held_prefix)]
+            return DeltaMessage(content=tail) if tail else None
 
         # Handle normal content before tool calls
         if not self.is_tool_call_started:
@@ -705,15 +768,22 @@ class Qwen3CoderToolParser(ToolParser):
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
             if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
                 self.is_tool_call_started = True
-                # Return any content before the tool call
+                content_before = ""
                 if tool_start > len(previous_text):
                     content_before = (
                         self._trailing_tool_marker_prefix(previous_text)
                         + delta_text[: tool_start - len(previous_text)]
                     )
-                    if content_before:
-                        return DeltaMessage(content=content_before)
-                return None
+                drained = self._drain_tool_blocks(current_text)
+                if content_before:
+                    merged_content = content_before + (
+                        drained.content if drained and drained.content else ""
+                    )
+                    return DeltaMessage(
+                        content=merged_content,
+                        tool_calls=drained.tool_calls if drained else [],
+                    )
+                return drained
             else:
                 pending_prefix = self._pending_tool_marker_delta_prefix(
                     previous_text, current_text, delta_text
@@ -732,7 +802,86 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
-        return self._stream_current_tool_block(current_text)
+        return self._drain_tool_blocks(current_text)
+
+    def _advance_closed_tool_block(self, current_text: str) -> bool:
+        """Advance state when the current tool block's closing tag has arrived."""
+        if not (self.json_closed and not self.in_function):
+            return False
+        starts = self._tool_start_positions(current_text)
+        block_idx = self._current_tool_block()
+        if block_idx >= len(starts):
+            return False
+        end_idx = current_text.find(self.tool_call_end_token, starts[block_idx])
+        if end_idx == -1:
+            return False
+        self.content_search_start = end_idx + len(self.tool_call_end_token)
+        self.current_tool_index += 1
+        self.header_sent = False
+        self.param_count = 0
+        self.in_param = False
+        self.param_raw_streamed = 0
+        self.json_started = False
+        self.json_closed = False
+        self.accumulated_params = {}
+        self.is_tool_call_started = self._current_tool_block() < len(starts)
+        return True
+
+    @staticmethod
+    def _append_delta_tool_call(
+        acc: list[DeltaToolCall], incoming: DeltaToolCall
+    ) -> None:
+        for idx, prev in enumerate(acc):
+            if prev.index == incoming.index:
+                prev_fn = prev.function
+                inc_fn = incoming.function
+                merged_name = (prev_fn.name if prev_fn and prev_fn.name else None) or (
+                    inc_fn.name if inc_fn and inc_fn.name else None
+                )
+                merged_args = ((prev_fn.arguments or "") if prev_fn else "") + (
+                    (inc_fn.arguments or "") if inc_fn else ""
+                )
+                acc[idx] = DeltaToolCall(
+                    index=prev.index,
+                    id=prev.id or incoming.id,
+                    type=prev.type or incoming.type,
+                    function=DeltaFunctionCall(
+                        name=merged_name,
+                        arguments=merged_args,
+                    ),
+                )
+                return
+        acc.append(incoming)
+
+    def _drain_tool_blocks(self, current_text: str) -> DeltaMessage | None:
+        """Drain all tool progress available in ``current_text`` across bursts."""
+        tool_calls: list[DeltaToolCall] = []
+        content_parts: list[str] = []
+        while self.is_tool_call_started:
+            msg = self._stream_current_tool_block(current_text)
+            if msg is not None:
+                if msg.content:
+                    content_parts.append(msg.content)
+                for tc in msg.tool_calls or []:
+                    self._append_delta_tool_call(tool_calls, tc)
+            starts = self._tool_start_positions(current_text)
+            block_idx = self._current_tool_block()
+            if (
+                msg is not None
+                and self.in_function
+                and not self.json_closed
+                and block_idx < len(starts)
+                and self.function_end_token in current_text[starts[block_idx] :]
+            ):
+                continue
+            if not self._advance_closed_tool_block(current_text):
+                break
+        if not tool_calls and not content_parts:
+            return None
+        return DeltaMessage(
+            content="".join(content_parts) if content_parts else None,
+            tool_calls=tool_calls,
+        )
 
     def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
         """Stream the progress of the <tool_call> block the parser is in."""
@@ -863,6 +1012,10 @@ class Qwen3CoderToolParser(ToolParser):
                         ]
                     )
                 self.streamed_args_for_tool[self.current_tool_index] += "{"
+                if self.current_tool_index < len(self.prev_tool_call_arr):
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        self.streamed_args_for_tool[self.current_tool_index]
+                    )
                 return DeltaMessage(
                     tool_calls=[
                         DeltaToolCall(
@@ -877,15 +1030,11 @@ class Qwen3CoderToolParser(ToolParser):
             )
             param_starts = self._parameter_start_positions(tool_text, param_config)
 
-            # Process ALL complete params in a loop (spec decode fix).
-            # With speculative decoding a single delta can deliver
-            # multiple complete parameters at once. The old single-pass
-            # code would process one and ``return None`` if the next was
-            # incomplete — skipping any already-complete params that
-            # preceded it. Using a loop with ``break`` instead ensures
-            # we emit every complete parameter before yielding control.
+            # Process complete params and incrementally stream schema-typed
+            # string parameters so large file/command payloads stream token-by-
+            # token instead of freezing SSE until </parameter>.
             json_fragments = []
-            while not self.in_param and self.param_count < len(param_starts):
+            while self.param_count < len(param_starts):
                 param_idx = param_starts[self.param_count]
                 param_start = param_idx + len(self.parameter_prefix)
                 remaining = tool_text[param_start:]
@@ -925,6 +1074,44 @@ class Qwen3CoderToolParser(ToolParser):
                         # Recover a missing final close before function/tool end.
                         value_end = container_end
                     else:
+                        if (
+                            not self.in_param
+                            and current_param_name in self.accumulated_params
+                        ):
+                            break
+                        if self._is_streamable_string_param(
+                            current_param_name, param_config
+                        ):
+                            if len(tool_text) <= value_start:
+                                break
+                            body_start = value_start + (
+                                1 if tool_text[value_start] == "\n" else 0
+                            )
+                            raw_body = tool_text[body_start:]
+                            already = self.param_raw_streamed if self.in_param else 0
+                            safe_len = self._safe_streamable_string_len(
+                                raw_body, already
+                            )
+                            if not self.in_param:
+                                key_prefix = (
+                                    f'"{current_param_name}": "'
+                                    if not self.accumulated_params
+                                    else f', "{current_param_name}": "'
+                                )
+                                escaped = json.dumps(
+                                    raw_body[:safe_len], ensure_ascii=False
+                                )[1:-1]
+                                json_fragments.append(key_prefix + escaped)
+                                self.in_param = True
+                                self.current_param_name = current_param_name
+                                self.param_raw_streamed = safe_len
+                            elif safe_len > self.param_raw_streamed:
+                                escaped = json.dumps(
+                                    raw_body[self.param_raw_streamed : safe_len],
+                                    ensure_ascii=False,
+                                )[1:-1]
+                                json_fragments.append(escaped)
+                                self.param_raw_streamed = safe_len
                         # Wait for structural lookahead. The current suffix may
                         # be literal </parameter> text inside a long value.
                         break
@@ -935,8 +1122,23 @@ class Qwen3CoderToolParser(ToolParser):
                 if param_value.endswith("\n"):
                     param_value = param_value[:-1]
 
+                if not self.in_param and current_param_name in self.accumulated_params:
+                    self.param_count += 1
+                    continue
+
+                is_first_emitted = len(self.accumulated_params) == 0
                 self.current_param_name = current_param_name
                 self.accumulated_params[current_param_name] = param_value
+
+                if self.in_param:
+                    tail_raw = param_value[self.param_raw_streamed :]
+                    escaped_tail = json.dumps(tail_raw, ensure_ascii=False)[1:-1]
+                    json_fragment = f'{escaped_tail}"'
+                    self.in_param = False
+                    self.param_raw_streamed = 0
+                    self.param_count += 1
+                    json_fragments.append(json_fragment)
+                    continue
 
                 converted_value = self._convert_param_value(
                     param_value,
@@ -947,7 +1149,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 serialized_value = json.dumps(converted_value, ensure_ascii=False)
 
-                if self.param_count == 0:
+                if is_first_emitted:
                     json_fragment = f'"{current_param_name}": {serialized_value}'
                 else:
                     json_fragment = f', "{current_param_name}": {serialized_value}'
@@ -960,6 +1162,10 @@ class Qwen3CoderToolParser(ToolParser):
 
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += combined
+                    if self.current_tool_index < len(self.prev_tool_call_arr):
+                        self.prev_tool_call_arr[self.current_tool_index][
+                            "arguments"
+                        ] = self.streamed_args_for_tool[self.current_tool_index]
                 else:
                     logger.warning(
                         "streamed_args_for_tool out of sync: index=%d len=%d",
@@ -1006,6 +1212,8 @@ class Qwen3CoderToolParser(ToolParser):
 
         return None
 
+    _uses_qwen_xml_tool_grammar = True
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -1015,9 +1223,59 @@ class Qwen3CoderToolParser(ToolParser):
         return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
-        return get_model_structural_tag(
-            model="qwen_3_5",
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            reasoning=get_enable_structured_outputs_in_reasoning(),
-        )
+        if not request.tools:
+            return None
+        reasoning = get_enable_structured_outputs_in_reasoning()
+
+        def _build(tools):
+            tag = get_model_structural_tag(
+                model="qwen_3_5",
+                tools=tools,
+                tool_choice=request.tool_choice,
+                reasoning=reasoning,
+            )
+            if tag is None:
+                return None
+            fmt = tag.format
+            if reasoning and isinstance(fmt, SequenceFormat) and len(fmt.elements) == 2:
+                prefix_fmt, suffix_fmt = fmt.elements
+                if isinstance(suffix_fmt, TagsWithSeparatorFormat):
+                    suffix_fmt = suffix_fmt.model_copy(update={"separator": "\n"})
+                    fmt = SequenceFormat(elements=[prefix_fmt, suffix_fmt])
+            else:
+                if isinstance(fmt, TagsWithSeparatorFormat):
+                    fmt = fmt.model_copy(update={"separator": "\n"})
+                if isinstance(fmt, TagsWithSeparatorFormat | TagFormat):
+                    fmt = SequenceFormat(
+                        elements=[
+                            OptionalFormat(
+                                content=RegexFormat(pattern="[ \\n\\t]{1,8}")
+                            ),
+                            fmt,
+                        ]
+                    )
+            return StructuralTag(format=fmt)
+
+        tag = _build(request.tools)
+        if tag is None:
+            return None
+        try:
+            Grammar.from_structural_tag(json.dumps(tag.model_dump()))
+            return tag
+        except Exception as exc:
+            logger.warning(
+                "Qwen3CoderToolParser: tool schemas are not xgrammar-compatible "
+                "(%s); retrying with unconstrained tool arguments.",
+                exc,
+            )
+            relaxed_tools = [tool.model_copy(deep=True) for tool in request.tools]
+            for tool in relaxed_tools:
+                tool.function.parameters = None
+            relaxed_tag = _build(relaxed_tools)
+            if relaxed_tag is None:
+                return None
+            try:
+                Grammar.from_structural_tag(json.dumps(relaxed_tag.model_dump()))
+                return relaxed_tag
+            except Exception:
+                return tag

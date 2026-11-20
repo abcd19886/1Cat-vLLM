@@ -25,6 +25,7 @@ from vllm.v1.attention.ops.sm70_e4m3_decode import wrap_e4m3_decode_attention
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_allowed,
     grouped_fp16_fp32_reason,
+    try_eager_grouped_fp32,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -377,6 +378,86 @@ class VerificationExecutor:
             is None
         )
 
+    def dispatch_fp16_grouped(
+        self,
+        fp16_grouped,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+        partition_size_hint: int | None,
+    ) -> bool:
+        if getattr(fp16_grouped, "multi_kv_heads", False):
+            if (
+                grouped_fp16_fp32_reason(
+                    self.grouped_admission,
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens,
+                    attn_metadata,
+                    out=out,
+                    partition_size_hint=partition_size_hint,
+                )
+                is not None
+            ):
+                return False
+            fp16_grouped(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=self.config.scale,
+            )
+        else:
+            kv_heads = per_kv_head_views(query, key_cache, value_cache, out)
+            if (
+                not kv_heads
+                or grouped_fp16_fp32_reason(
+                    self.grouped_admission,
+                    kv_heads[0].query,
+                    kv_heads[0].key,
+                    kv_heads[0].value,
+                    block_table,
+                    seq_lens,
+                    attn_metadata,
+                    out=kv_heads[0].out,
+                    partition_size_hint=partition_size_hint,
+                )
+                is not None
+            ):
+                return False
+            for head in kv_heads:
+                fp16_grouped(
+                    head.query,
+                    head.key,
+                    head.value,
+                    attn_metadata.block_table,
+                    seq_lens,
+                    out=head.out,
+                    softmax_scale=self.config.scale,
+                )
+                if head.out is not out:
+                    out[:, head.query_heads].copy_(head.out)
+        logger.info_once(
+            "FLASH_ATTN_V100 FP16 KV grouped verifier active "
+            "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
+            key_cache.shape[1],
+            key_cache.shape[2],
+            scope="process",
+        )
+        _routing.record_route(
+            _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
+        )
+        return True
+
     def call_smallq_decode_paged(
         self,
         layer: torch.nn.Module,
@@ -393,48 +474,17 @@ class VerificationExecutor:
         partition_size_hint: int | None,
     ) -> None:
         fp16_grouped = self.ops.fp16_grouped
-        kv_heads = (
-            per_kv_head_views(query, key_cache, value_cache, out)
-            if fp16_grouped is not None
-            else ()
-        )
-        if (
-            kv_heads
-            and grouped_fp16_fp32_reason(
-                self.grouped_admission,
-                kv_heads[0].query,
-                kv_heads[0].key,
-                kv_heads[0].value,
-                block_table,
-                seq_lens,
-                attn_metadata,
-                out=kv_heads[0].out,
-                partition_size_hint=partition_size_hint,
-            )
-            is None
+        if fp16_grouped is not None and self.dispatch_fp16_grouped(
+            fp16_grouped,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            attn_metadata,
+            out=out,
+            partition_size_hint=partition_size_hint,
         ):
-            for head in kv_heads:
-                fp16_grouped(
-                    head.query,
-                    head.key,
-                    head.value,
-                    attn_metadata.block_table,
-                    seq_lens,
-                    out=head.out,
-                    softmax_scale=self.config.scale,
-                )
-                if head.out is not out:
-                    out[:, head.query_heads].copy_(head.out)
-            logger.info_once(
-                "FLASH_ATTN_V100 FP16 KV grouped verifier active "
-                "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
-                key_cache.shape[1],
-                key_cache.shape[2],
-                scope="process",
-            )
-            _routing.record_route(
-                _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
-            )
             return
         grouped_op = self.ops.e4m3_grouped
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
@@ -468,6 +518,32 @@ class VerificationExecutor:
                 key_cache.shape[1],
                 scope="process",
             )
+            _routing.log_fp8_kv_cache_route(
+                "decode", self.config.kv_cache_dtype, "grouped_fp32"
+            )
+            _routing.record_route(
+                _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
+            )
+            return
+        if (
+            grouped_op is not None
+            and not _routing.is_cuda_graph_capturing(query)
+            and try_eager_grouped_fp32(
+                self.grouped_admission,
+                grouped_op,
+                self.config.scale,
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                attn_metadata,
+                out=out,
+                max_seq_len_hint=max_seq_len_hint,
+                partition_size_hint=partition_size_hint,
+            )
+        ):
             _routing.log_fp8_kv_cache_route(
                 "decode", self.config.kv_cache_dtype, "grouped_fp32"
             )

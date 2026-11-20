@@ -392,9 +392,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
   if (SM70_TURBOMIND_ARCHS)
-    list(APPEND VLLM_EXT_SRC "csrc/sm70_ring_collectives.cu")
+    list(APPEND VLLM_EXT_SRC "csrc/sm70_ring_collectives.cu" "csrc/host_reduce.cu")
     set_gencode_flags_for_srcs(
-      SRCS "csrc/sm70_ring_collectives.cu"
+      SRCS "csrc/sm70_ring_collectives.cu" "csrc/host_reduce.cu"
       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
     set(VLLM_SM70_TURBOMIND_ROOT
         "${CMAKE_CURRENT_LIST_DIR}/csrc/sm70_turbomind")
@@ -439,6 +439,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_q8_moe_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_moe_permute_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"

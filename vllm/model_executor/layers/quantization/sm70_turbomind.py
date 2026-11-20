@@ -154,26 +154,40 @@ def use_batched_gemm_layouts() -> bool:
     return bool(layer_policy().batch_gemm_layouts) and is_exact_sm70_cuda_platform()
 
 
-def use_native_qpn_layouts() -> bool:
-    """Use one native layout for the qualified TP4, at-most-M32 verifier.
+def use_native_qpn_layouts(*, allow_large_batches: bool = False) -> bool:
+    """Use one resident native QPN layout when native decode + bounded prefill
+    cover the configured workload across tensor-parallel degrees.
 
-    Larger batch capacities retain their existing prepared batch GEMMs until
-    the packed-only fallback is admitted at those decode shapes.
+    FP8 keeps ``allow_large_batches=False`` so >32-row batches retain their
+    prepared TurboMind batch GEMM, whereas NVFP4 native QPN2 + bounded prefill
+    is admitted across all speculative widths, TP sizes, and batch capacities.
     """
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
-    if config is None or config.speculative_config is None:
+    if config is None:
         return False
-    text = config.model_config.hf_text_config
-    return bool(
+    model_config = getattr(config, "model_config", None)
+    scheduler_config = getattr(config, "scheduler_config", None)
+    if model_config is None or scheduler_config is None:
+        return False
+    text = getattr(model_config, "hf_text_config", None)
+    hidden_size = getattr(text, "hidden_size", None)
+    if not (
         is_exact_sm70_cuda_platform()
-        and config.parallel_config.tensor_parallel_size == 4
-        and config.scheduler_config.max_num_seqs <= 4
-        and config.speculative_config.num_speculative_tokens == 7
-        and getattr(text, "hidden_size", None) == 5120
-        and getattr(text, "model_type", None) == "qwen3_5_text"
-    )
+        and isinstance(hidden_size, int)
+        and hidden_size >= 1024
+        and hidden_size % 128 == 0
+    ):
+        return False
+    if allow_large_batches:
+        return True
+    spec = getattr(config, "speculative_config", None)
+    if spec is None:
+        return False
+    steps = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+    max_seqs = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
+    return 0 < max_seqs * (steps + 1) <= 32
 
 
 def fp8_backend_enabled() -> bool:
@@ -566,6 +580,8 @@ _QPN2_LAUNCH_TABLE: dict[tuple[int, int], tuple[int, int]] = {
     (1536, 5120): (16, 2),
     (4352, 5120): (16, 2),
     (5120, 8704): (8, 2),
+    (5120, 8256): (16, 2),
+    (5120, 4128): (16, 2),
     (5120, 4096): (16, 2),
     (5120, 2048): (32, 2),
     (5120, 62080): (8, 1),
@@ -864,3 +880,40 @@ def apply_prepared_fused_silu_and_mul(
     if state is None:
         return None
     return apply_prepared(state, x, None, getattr(layer, "prefix", ""), gated=True)
+
+
+def should_prepare_channel_qpn8_batch_tm(
+    linear_policy,
+    *,
+    platform=None,
+) -> bool:
+    active_platform = current_platform if platform is None else platform
+    batch_prescaled_explicit = bool(
+        linear_policy.batch_prescaled
+        and linear_policy.sources.get("batch_prescaled") != "default"
+    )
+    native_only = bool(
+        use_native_qpn_layouts(allow_large_batches=True)
+        and active_platform.is_device_capability(70)
+        and not batch_prescaled_explicit
+    )
+    return bool(use_batched_gemm_layouts() and not native_only)
+
+
+def attach_channel_qpn8_prefill_workspace(
+    layer: torch.nn.Module,
+    workspace: torch.Tensor,
+) -> None:
+    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
+    if getattr(layer, "prefix", ""):
+        from vllm.model_executor.layers.quantization.utils import (
+            sm70_layer_workspaces,
+        )
+
+        if (
+            sm70_layer_workspaces._engine_workspace_registry() is not None
+            or layer.prefix not in sm70_layer_workspaces._layer_workspaces
+        ):
+            sm70_layer_workspaces.register_layer_workspace(
+                layer, workspace, family="fp8"
+            )

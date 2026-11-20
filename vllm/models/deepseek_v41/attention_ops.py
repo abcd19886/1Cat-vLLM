@@ -912,19 +912,73 @@ def _cuda_index_scores():
     return _CUDA_INDEX["ok"]
 
 
+def _index_reduce_live(bank, partial, positions, ratio, width):
+    """INDEX_REDUCE: sum the four ranks' partial scores over the live columns only.
+
+    v41k index_reduce_live reads every rank's bank over CUDA IPC (per-CTA
+    epoch flags, release/acquire at system scope) and adds columns
+    [0, (positions[-1] + 1) // ratio) in rank order 0..3 in FP32, rounding
+    once: the custom all-reduce 1-stage numerics, the same on every rank.
+    Columns past the live end are not written; index_topk never reads them.
+    """
+    out = torch.empty_like(partial)
+    torch.ops.v41k.index_reduce_live(
+        out, *bank.pointers, bank.rank, bank.epochs, positions.long(), ratio, width
+    )
+    return out[:, :width]
+
+
 def select_packed_positions(
-    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
+    q,
+    weights,
+    keys,
+    positions,
+    valid_tokens,
+    ratio,
+    all_reduce,
+    *,
+    top_k=512,
+    bank=None,
+    scorer=None,
 ):
-    """select_compressed_positions over packed, position-addressed index keys."""
+    """select_compressed_positions over packed, position-addressed index keys.
+
+    bank: the store's V41IndexBank (VLLM_V41_INDEX_REDUCE=1) or None. With a
+    bank, decode scores are written into this rank's bank slot and reduced
+    over the live prefix by _index_reduce_live instead of all_reduce.
+    """
     from vllm.models.deepseek_v41.index_topk import index_topk
 
     tokens, heads = q.shape[0], q.shape[1]
     if tokens * heads <= 64:
         # Decode: bounded fused scores over the live keys only (graph-safe).
-        scores = torch.empty(
-            tokens, keys.shape[0], dtype=torch.float16, device=q.device
+        # The tiled scorer (#1372) writes dense rows; keep it off the bank's
+        # strided slot so the two opt-in paths never stack.
+        live = (
+            bank is not None
+            and scorer is None
+            and tokens <= bank.partial.shape[0]
+            and keys.shape[0] <= bank.width
+            and _cuda_index_scores()
         )
-        if _cuda_index_scores():
+        if live:
+            # index_scores_decode uses out.size(1) as the row stride.
+            scores = bank.partial[:tokens]
+        else:
+            scores = torch.empty(
+                tokens, keys.shape[0], dtype=torch.float16, device=q.device
+            )
+        if scorer is not None:
+            scorer.scores(
+                scores,
+                q.reshape(-1, 128).contiguous(),
+                weights.reshape(-1).contiguous(),
+                keys,
+                positions.long(),
+                heads,
+                ratio,
+            )
+        elif _cuda_index_scores():
             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
             torch.ops.v41k.index_scores_decode(
                 scores,
@@ -955,7 +1009,10 @@ def select_packed_positions(
                 BLOCKS=_DECODE_BLOCKS,
                 num_warps=4,
             )
-        scores = all_reduce(scores)
+        if live:
+            scores = _index_reduce_live(bank, scores, positions, ratio, keys.shape[0])
+        else:
+            scores = all_reduce(scores)
         result = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
         if keys.shape[0] > 16384:
             from vllm.models.deepseek_v41.index_topk import index_topk_parallel
@@ -1697,9 +1754,15 @@ def select_compressed_positions_batch(
         # single-request gather + cuBLAS scores, row by row (decode-only
         # steps, and so every graph, take the batched kernel below).
         result = torch.full((tokens, width), -1, device=q.device, dtype=torch.int32)
-        last_positions = positions[
-            torch.tensor(starts[1:], device=positions.device).clamp(min=1) - 1
-        ].tolist()
+        seq_cpu = getattr(layout, "seq_lens_cpu", None)
+        if seq_cpu is not None and not getattr(layout, "is_dummy", False):
+            last_positions = [
+                max(0, int(v) - 1) for v in seq_cpu[: layout.num_reqs].tolist()
+            ]
+        else:
+            last_positions = positions[
+                torch.tensor(starts[1:], device=positions.device).clamp(min=1) - 1
+            ].tolist()
         if (
             _INDEX_SHARD
             and all_gather is not None
@@ -1901,20 +1964,42 @@ def _sharded_index_core(
     q = q_all
     local_columns = triton.cdiv(columns, kt * world) * kt
     head = torch.empty(tokens, local_columns, dtype=torch.float16, device=q.device)
-    torch.ops.v41sk.index_scores_shard(
-        head,
-        q_all,
-        w_all,
-        cache,
-        block_table,
-        positions if positions.dtype == torch.int64 else positions.long(),
-        layout.query_start_loc,
-        layout.num_reqs,
-        ratio,
-        min(triton.cdiv(local_columns, kt), max(32, 320 // max(1, layout.num_reqs))),
-        rank,
-        world,
-    )
+    if (
+        layout.num_reqs == 1
+        and (tokens > 6 or layout.query_start_loc is None)
+        and q_all.shape[1] == 32
+        and hasattr(torch.ops.v41sk, "index_scores_prefill_shard")
+    ):
+        torch.ops.v41sk.index_scores_prefill_shard(
+            head,
+            q_all,
+            w_all,
+            cache,
+            block_table,
+            (
+                positions if positions.dtype == torch.int64 else positions.long()
+            ).contiguous(),
+            ratio,
+            rank,
+            world,
+        )
+    else:
+        torch.ops.v41sk.index_scores_shard(
+            head,
+            q_all,
+            w_all,
+            cache,
+            block_table,
+            positions if positions.dtype == torch.int64 else positions.long(),
+            layout.query_start_loc,
+            layout.num_reqs,
+            ratio,
+            min(
+                triton.cdiv(local_columns, kt), max(32, 320 // max(1, layout.num_reqs))
+            ),
+            rank,
+            world,
+        )
     # This rank's keys below each row's length (whole tiles t % world == rank,
     # plus the partial last tile when it is ours), as the select kernels'
     # positions: p = mine * ratio - 1 makes their (p + 1) // ratio == mine.
@@ -2063,28 +2148,62 @@ def _sharded_index_prefill(
             continue
         columns = max(-(-(int(last_positions[r]) + 1) // ratio), top_k)
         local_columns = triton.cdiv(columns, kt * world) * kt
-        tile = max(group, min(1536, (64 << 20) // (2 * local_columns) // group * group))
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        use_pf_shard = (
+            q_all.shape[1] == 32
+            and b - a > group
+            and hasattr(torch.ops.v41sk, "index_scores_prefill_shard")
+        )
+        tile = max(
+            group,
+            min(
+                4096 if use_pf_shard else 1536,
+                (128 << 20 if use_pf_shard else 64 << 20)
+                // (2 * local_columns)
+                // group
+                * group,
+            ),
+        )
         for first in range(a, b, tile):
             last = min(first + tile, b)
-            groups = triton.cdiv(last - first, group)
-            qsl = (
-                torch.arange(groups + 1, device=q.device, dtype=torch.int32) * group
-            ).clamp_(max=last - first)
-            result[first:last] = _sharded_index_core(
-                q_all[first:last],
-                w_all[first:last],
-                cache,
-                block_table[r : r + 1].expand(groups, -1),
-                positions[first:last],
-                valid_tokens[first:last],
-                SimpleNamespace(query_start_loc=qsl, num_reqs=groups),
-                ratio,
-                columns,
-                top_k,
-                all_gather,
-                rank,
-                world,
-            )
+            if use_pf_shard:
+                result[first:last] = _sharded_index_core(
+                    q_all[first:last],
+                    w_all[first:last],
+                    cache,
+                    block_table[r : r + 1],
+                    positions[first:last],
+                    valid_tokens[first:last],
+                    SimpleNamespace(query_start_loc=None, num_reqs=1),
+                    ratio,
+                    columns,
+                    top_k,
+                    all_gather,
+                    rank,
+                    world,
+                )
+            else:
+                groups = triton.cdiv(last - first, group)
+                qsl = (
+                    torch.arange(groups + 1, device=q.device, dtype=torch.int32) * group
+                ).clamp_(max=last - first)
+                result[first:last] = _sharded_index_core(
+                    q_all[first:last],
+                    w_all[first:last],
+                    cache,
+                    block_table[r : r + 1].expand(groups, -1),
+                    positions[first:last],
+                    valid_tokens[first:last],
+                    SimpleNamespace(query_start_loc=qsl, num_reqs=groups),
+                    ratio,
+                    columns,
+                    top_k,
+                    all_gather,
+                    rank,
+                    world,
+                )
 
 
 def _bindex_scores_launch(

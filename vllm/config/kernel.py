@@ -706,8 +706,41 @@ class Sm70RingConfig:
 
 
 @config
+class TopologyAllReduceConfig:
+    """Experimental measured single-node CUDA IPC all-reduce selection."""
+
+    enabled: bool = False
+    """Qualify and select routes before first model compilation and capture."""
+
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
+
+    cache_dir: str | None = None
+    """Selection cache directory; None uses PyTorch's default extension root."""
+
+
+@config
+class HostReduceConfig:
+    """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
+    peer access; exact, the same bits as NCCL's two-rank sum."""
+
+    enabled: bool = True
+    """Admit the operator for two-rank groups whose GPUs NCCL cannot connect
+    peer to peer."""
+
+    max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
+    """Largest payload; larger all-reduces stay on NCCL."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    topology_all_reduce: TopologyAllReduceConfig = Field(
+        default_factory=TopologyAllReduceConfig
+    )
+    """Opt-in topology-aware peer reduction with startup measured selection."""
 
     layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
     """Per-engine execution decisions and initialization provenance."""
@@ -827,10 +860,16 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
-    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    hc_weight_storage: Literal["replicated", "sharded"] | None = None
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    hc_weight_storage_auto: bool = Field(default=False, init=False)
+    """Whether sharded HC storage was selected automatically."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
+
+    host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
+    """Two-rank host-memory all-reduce policy, resolved from peer access."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -922,10 +961,11 @@ class KernelConfig:
     Explicit false keeps dense verification."""
 
     sm70_sparse_target_sampling: bool | None = None
-    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    """Verify argmax drafts of top-k sampled requests from TP-local target
     candidates (merged global top-k) instead of full-vocabulary logits and the
-    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
-    back to the full-vocabulary sampler."""
+    dense sampler. By default, enable this for the SM70 Qwen3.5/3.8 native MTP
+    contract. Exact: requests with an ambiguous top-k/top-p cutoff fall back to
+    the full-vocabulary sampler."""
 
     sm70_sparse_target_reference_check: bool | None = None
     """With sparse target sampling, copy the candidates to the host each round
@@ -1002,9 +1042,13 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
-    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    qsa_host_kv_dtype: Literal["int8_per_token_head", "int8", "fp8_e4m3", "float16"] = (
+        "int8_per_token_head"
+    )
     """Authoritative target history format; FP16 isolates placement error."""
-    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    qsa_host_kv_draft_dtype: Literal[
+        "int8_per_token_head", "int8", "fp8_e4m3", "float16"
+    ] = "float16"
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
@@ -1014,9 +1058,11 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
-    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
-    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
-    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_hot_dtype: Literal[
+        "auto", "float16", "fp8_e4m3", "int8_per_token_head", "int8"
+    ] = "auto"
+    """Target hot storage; 'auto' follows qsa_host_kv_dtype so encoded 8-bit
+    history keeps matching 8-bit hot pages and 3 CTAs/SM native occupancy."""
     qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
     """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
@@ -1037,7 +1083,7 @@ class KernelConfig:
     """Shared prefix staging buffers. One slot reuses the current layer's
     buffer after its attention completion event; prefetch still overlaps the
     following non-QSA computation. Two preserves the alternating layout."""
-    qsa_host_kv_trim_warmup_cache: bool = False
+    qsa_host_kv_trim_warmup_cache: bool | None = None
     """Return unused allocator pages once after host-QSA kernel/graph warmup.
     Active tensors and captured private pools remain owned; inference does
     not trim pages. This initialization resource policy does not change
@@ -1056,6 +1102,14 @@ class KernelConfig:
 
     Zero retains the shared capacity. A nonzero pool retains active states and
     bounded prefix checkpoints while history IDs use a separate range.
+    """
+    qsa_host_kv_history_blocks: int = Field(default=0, ge=0)
+    """Target history-block capacity when qsa_host_kv_state_blocks is nonzero.
+
+    Zero retains the single-window default. A positive value expands the
+    decoupled history pool up to this block count (capped by available GPU
+    memory), multiplying total KV token capacity without inflating device
+    recurrent-state storage.
     """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
@@ -1182,6 +1236,27 @@ class KernelConfig:
             )
         if self.sm70_hcx_local_schedule is None:
             self.sm70_hcx_local_schedule = bool(self.sm70_hcx)
+        if self.hc_weight_storage is None:
+            model = getattr(cfg, "model_config", None)
+            text = getattr(model, "hf_text_config", None)
+            parallel = getattr(cfg, "parallel_config", None)
+            tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+            if (
+                qwen4_sm70
+                and self.hc_ll_shard
+                and tp_size == 4
+                and getattr(cfg, "lora_config", None) is None
+                and (
+                    getattr(text, "hc_count", None),
+                    getattr(text, "hidden_size", None),
+                    getattr(text, "hc_lowrank", None),
+                )
+                == (4, 2560, 320)
+            ):
+                self.hc_weight_storage = "sharded"
+                self.hc_weight_storage_auto = True
+            else:
+                self.hc_weight_storage = "replicated"
         if self.sm70_top1x is None:
             self.sm70_top1x = qwen4_sm70
         if self.sm70_greedy_verify is None:
@@ -1189,7 +1264,7 @@ class KernelConfig:
         if self.sm70_sparse_target_sampling is None:
             self.sm70_sparse_target_sampling = prefer
         if self.sm70_sparse_target_reference_check is None:
-            self.sm70_sparse_target_reference_check = not prefer
+            self.sm70_sparse_target_reference_check = not qwen4_sm70
         if self.sm70_draft_single_graph is None:
             self.sm70_draft_single_graph = prefer
         if self.sm70_mtp_refined_head is None:
@@ -1241,7 +1316,10 @@ class KernelConfig:
     def resolve_attention_history(self, cfg) -> bool:
         from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
 
-        return resolve_qsa_host_kv(cfg)
+        active = resolve_qsa_host_kv(cfg)
+        if self.qsa_host_kv_trim_warmup_cache is None:
+            self.qsa_host_kv_trim_warmup_cache = bool(active)
+        return active
 
     @property
     def capture_all_draft_steps(self) -> bool:
@@ -1331,6 +1409,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "gdn",  # Hash only initialized computation policy below.
             "sm70_marlin",  # Hash only when the provider is prepared.
@@ -1342,6 +1421,7 @@ class KernelConfig:
             "linear_kernel_selections",
             "collective_kernel_selections",
             "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
+            "hc_weight_storage_auto",  # Diagnostic origin only.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
@@ -1362,6 +1442,8 @@ class KernelConfig:
             "qsa_host_kv_reason",
             "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
+            # Collective transport chosen outside the compiled graph.
+            "host_reduce",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
@@ -1397,6 +1479,10 @@ class KernelConfig:
         if not self.sm70_mxfp4.values:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        if self.topology_all_reduce.enabled:
+            factors["topology_all_reduce"] = dict(
+                enabled=True, precision=self.topology_all_reduce.precision
+            )
         factors["layer_execution"] = self.layer_execution.compute_hash()
         if self.sm70_sparse.active:
             factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
@@ -1515,6 +1601,39 @@ class KernelConfig:
             self.ir_op_priority,
         )
 
+    def resolve_fp8_verifier_defaults(
+        self,
+        *,
+        model_quantization: str | None,
+        speculative_config: Any,
+        qualification: dict[str, Any],
+        use_native_block_prefill: bool,
+    ) -> None:
+        if speculative_config is not None:
+            policy = speculative_config.sm70_dflash2
+            policy.resolve(**qualification)
+            if (
+                model_quantization in ("fp8", "compressed-tensors")
+                and self.sm70_fp8.qpn8 is None
+                and (
+                    policy.qualified
+                    or qualification.get("mtp_qualified", False)
+                    or "target_fp8_qpn8" in policy.explicit_fields
+                )
+            ):
+                self.sm70_fp8.qpn8 = policy.target_fp8_qpn8
+        if model_quantization in ("fp8", "compressed-tensors"):
+            import torch
+
+            if (
+                use_native_block_prefill
+                and self.sm70_fp8.block_qpn8_volta_turbomind_prefill is None
+                and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+            ):
+                self.sm70_fp8.block_qpn8_volta_turbomind_prefill = False
+            # Resolve after the per-engine verifier defaults.
+            self.sm70_fp8.resolve()
+
 
 def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     """Capture the shared serialized/channel/ModelOpt policy during loading."""
@@ -1524,3 +1643,56 @@ def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     policy = engine.kernel_config.sm70_fp8 if engine else Sm70Fp8Config()
     policy.resolve()
     return policy
+
+
+def is_adaptive_mtp_enabled(
+    speculative_config: Any,
+    num_spec_tokens: int,
+) -> bool:
+    """Return whether async adaptive MTP depth (EntMTP) is enabled."""
+    if (
+        speculative_config is None
+        or getattr(speculative_config, "method", None) != "mtp"
+        or num_spec_tokens < 3
+    ):
+        return False
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    raw = (
+        str(policy.adaptive_mtp if policy.adaptive_mtp is not None else "auto")
+        .strip()
+        .lower()
+    )
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw == "auto":
+        from vllm.platforms import current_platform
+
+        return bool(
+            num_spec_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+    return False
+
+
+def adaptive_mtp_min_k(
+    num_spec_tokens: int,
+    speculative_config: Any = None,
+) -> int:
+    """Return the minimum adaptive MTP draft depth clamped to [2, k_max]."""
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    try:
+        val = (
+            int(policy.adaptive_mtp_min_k)
+            if policy.adaptive_mtp_min_k is not None
+            else 2
+        )
+    except (TypeError, ValueError):
+        val = 2
+    return max(2, min(val, num_spec_tokens))

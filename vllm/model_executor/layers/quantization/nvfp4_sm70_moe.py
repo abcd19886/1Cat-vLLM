@@ -17,6 +17,7 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.sm70_moe import Sm70NvFp4MoEConfig, capture_nvfp4_moe_config
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import diagnostic_history
@@ -81,6 +82,7 @@ _SUPPORTED_CONTRACTS: Final = {
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
     (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
     (4096, 2048, 288, 8),  # GLM-5.3-Flash
+    (2816, 704, 128, 8),  # Gemma-4-26B-A4B
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
@@ -382,12 +384,12 @@ def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
 
 
 def _use_grouped_batch(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
-    """Admit prepared SM70 grouped NVFP4 decode/verify across M=2..40 and TP shards."""
+    """Admit prepared SM70 grouped NVFP4 decode/verify across M=2..64 and TP shards."""
     return bool(
         getattr(layer, "sm70_nvfp4_grouped_batch", False)
         and _nvfp4_policy(layer).qpn_mtp5
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 40
+        and 2 <= x.shape[0] <= 64
         and x.shape[1] == 2560
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -805,7 +807,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise NotImplementedError("SM70 NVFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
             raise NotImplementedError(
-                "SM70 NVFP4 MoE currently supports SwiGLU/SILU only."
+                f"SM70 NVFP4 MoE supports SwiGLU/SILU only, got "
+                f"{layer.activation}; quantize with compressed-tensors "
+                f"for the generic MoE path."
             )
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
@@ -871,8 +875,24 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "retaining separate exact W13 and activation kernels."
             )
         fast_prefill = bool(fused_swiglu_prefill and _nvfp4_policy(layer).fast_prefill)
+        policy = _nvfp4_policy(layer)
+        raw_scale_explicit = "raw_scale" in policy.explicit_fields
+        vllm_cfg = get_current_vllm_config_or_none()
+        ubatching = bool(
+            vllm_cfg is not None
+            and getattr(vllm_cfg.parallel_config, "use_ubatching", False)
+        )
+        grouped_raw_capable = bool(
+            hasattr(self.native_ops, "has_nvfp4_grouped_raw_scale_dispatch")
+            and self.native_ops.has_nvfp4_grouped_raw_scale_dispatch()
+            and (policy.grouped_decode or (policy.grouped_mtp5 and policy.qpn_mtp5))
+            and layer.swiglu_limit is None
+        )
+        raw_scale_auto = bool(
+            not raw_scale_explicit and not ubatching and grouped_raw_capable
+        )
         raw_scale_requested = bool(
-            _nvfp4_policy(layer).raw_scale
+            (policy.raw_scale or raw_scale_auto)
             and int(layer.moe_config.tp_size) == 4
             and num_experts == 512
             and hidden == 2560
@@ -880,7 +900,6 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and int(layer.moe_config.experts_per_token) == 10
         )
         raw_scale_available = self.native_ops.has_nvfp4_qpn_raw_scale_dispatch()
-        raw_scale_explicit = "raw_scale" in _nvfp4_policy(layer).explicit_fields
         if raw_scale_requested and not raw_scale_available and raw_scale_explicit:
             raise RuntimeError(
                 "SM70 Qwen3.8 raw E4M3 scale storage requires the matching "
@@ -1024,6 +1043,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
         prepared_w13_scales = torch.stack(w13_tm_scales)
         prepared_w2_scales = torch.stack(w2_tm_scales)
+        raw_fast_qpn = True
         if raw_scale:
             raw_w13_codes = torch.stack(w13_raw_scale_codes)
             raw_w13_globals = torch.stack(w13_raw_global_scales).float()
@@ -1048,7 +1068,27 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 prepared_w2_scales,
                 False,
             )
-            if not (w13_exact and w2_exact):
+            raw_fast_qpn = bool(w13_exact and w2_exact)
+            strict_exact = raw_fast_qpn
+            if not strict_exact and grouped_raw_capable and not raw_scale_explicit:
+                self.native_ops.nvfp4_expand_raw_scales_sm70_out(
+                    w13_workspace,
+                    raw_w13_codes,
+                    raw_w13_globals,
+                    fused_swiglu_prefill,
+                    False,
+                )
+                w13_strict = torch.equal(w13_workspace, prepared_w13_scales)
+                self.native_ops.nvfp4_expand_raw_scales_sm70_out(
+                    w2_workspace,
+                    raw_w2_codes,
+                    raw_w2_globals,
+                    False,
+                    False,
+                )
+                w2_strict = torch.equal(w2_workspace, prepared_w2_scales)
+                strict_exact = bool(w13_strict and w2_strict)
+            if not strict_exact:
                 if raw_scale_explicit:
                     raise RuntimeError(
                         "SM70 Qwen3.8 raw E4M3 scale reconstruction is not "
@@ -1160,7 +1200,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and hidden == 2560
             and intermediate in (160, 320, 640)
             and layer.sm70_nvfp4_top_k == 10
-            and not raw_scale
+            and (
+                not raw_scale
+                or (
+                    hasattr(self.native_ops, "has_nvfp4_grouped_raw_scale_dispatch")
+                    and self.native_ops.has_nvfp4_grouped_raw_scale_dispatch()
+                )
+            )
             and layer.swiglu_limit is None
         )
         grouped_requested = bool(
@@ -1192,13 +1238,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             # cache or additional activation buffer inside graph capture.
             device = layer.w13_tm_weight.device
             layer._nvfp4_grouped_rows = torch.empty(
-                400, 8, dtype=torch.int32, device=device
+                640, 8, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_experts = torch.empty(
-                400, dtype=torch.int32, device=device
+                640, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_sizes = torch.empty(
-                400, dtype=torch.int32, device=device
+                640, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
@@ -1210,6 +1256,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raw_scale=bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False)),
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             bindings=self.native_ops,
+            raw_fast_qpn=raw_fast_qpn,
         )
         self._allocate_graph_safe_decode_buffers(layer)
 
@@ -1325,7 +1372,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     if use_batch_reduce
                     else Stage.ACTIVE_GROUPED
                 ),
-                w13_split_k=(4 if intermediate == 160 or num_tokens <= 8 else 8),
+                w13_split_k=8 if 6 <= num_tokens <= 8 else 4,
                 interleaved=interleaved_w13,
             )
             execute_fp4(layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights)
